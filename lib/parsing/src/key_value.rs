@@ -9,7 +9,7 @@ use nom::{
     multi::{many1, many_m_n, separated_list1},
     regexp::str::re_find,
     sequence::{delimited, preceded, terminated, tuple},
-    IResult, Parser,
+    IResult,
 };
 use regex::Regex;
 use std::str::FromStr;

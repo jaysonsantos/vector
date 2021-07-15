@@ -5,10 +5,10 @@ use lookup::LookupBuf;
 use parsing::value::Value;
 use shared::btreemap;
 
-use crate::field_traversal::{get_field, insert_field};
 use crate::grok_filter::apply_filter;
+use crate::insert_field::insert_field;
 use crate::parse_grok_rules::GrokRule;
-use tracing::error;
+use tracing::warn;
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum Error {
@@ -40,35 +40,28 @@ fn apply_grok_rule(source: &str, grok_rule: &GrokRule) -> Result<Value, Error> {
             let path: LookupBuf = if name == "." {
                 LookupBuf::root()
             } else {
-                name.parse().expect("path always should be valid")
+                name.parse().expect("path should always be valid")
             };
-            insert_field(&mut parsed, path, Value::from(value))
-                .map_err(
-                    |error| error!(message = "Error updating field value", path = %name, %error),
-                )
-                .unwrap();
-        }
 
-        // apply filters
-        grok_rule.filters.iter().for_each(|(path, filters)| {
-            filters.iter().for_each(|filter| {
-                let result = apply_filter(
-                    get_field(&parsed, path)
-                        .expect("the field value is missing")
-                        .unwrap(),
-                    filter,
-                );
-                if let Ok(value) = result {
-                        insert_field(&mut parsed, path.to_owned(), value)
-                        .map_err(|error| error!(message = "Error updating field value", path = %path, %error))
-                        .unwrap();
-                } else {
-                        insert_field(&mut parsed, path.to_owned(), Value::Null)
-                        .map_err(|error| error!(message = "Error updating field value", path = %path, %error))
-                        .unwrap();
-                }
-            });
-        });
+            let mut value = Value::from(value);
+
+            // apply filters
+            if let Some(filters) = grok_rule.filters.get(&path) {
+                filters.iter().for_each(|filter| {
+                    match apply_filter(&value, filter) {
+                        Ok(v) => value = v,
+                        Err(error) => {
+                            warn!(message = "Error updating field value", path = %path, filter = %filter, %error);
+                            value = Value::Null;
+                        }
+                    }
+                });
+            };
+
+            insert_field(&mut parsed, path.clone(), value).unwrap_or_else(
+                |error| warn!(message = "Error updating field value", path = %path, %error),
+            );
+        }
 
         Ok(parsed)
     } else {
@@ -193,6 +186,41 @@ mod tests {
                 Ok(Value::Bytes(r#""test  ""#.into())),
             ),
         ]);
+    }
+
+    #[test]
+    fn supports_filters_without_fields() {
+        // if the value, after filters applied, is a map then merge it at the root level
+        test_grok_pattern_without_field(vec![(
+            "%{notSpace:standalone_field} '%{data::json}' '%{data::json}'",
+            r#"value1 '{ "json_field1": "value2" }' '{ "json_field2": "value3" }'"#,
+            Ok(Value::from(btreemap! {
+                "standalone_field" => Value::Bytes("value1".into()),
+                "json_field1" => Value::Bytes("value2".into()),
+                "json_field2" => Value::Bytes("value3".into())
+            })),
+        )]);
+        test_grok_pattern_without_field(vec![(
+            "%{notSpace:standalone_field} '%{data:nested.json:json}' '%{data:nested.json:json}'",
+            r#"value1 '{ "json_field1": "value2" }' '{ "json_field2": "value3" }'"#,
+            Ok(Value::from(btreemap! {
+                "standalone_field" => Value::Bytes("value1".into()),
+                "nested" => btreemap! {
+                    "json" =>  btreemap! {
+                        "json_field1" => Value::Bytes("value2".into()),
+                        "json_field2" => Value::Bytes("value3".into())
+                    }
+                }
+            })),
+        )]);
+        // otherwise ignore it
+        test_grok_pattern_without_field(vec![(
+            "%{notSpace:standalone_field} %{data::integer}",
+            r#"value1 1"#,
+            Ok(Value::from(btreemap! {
+                "standalone_field" => Value::Bytes("value1".into()),
+            })),
+        )]);
     }
 
     #[test]
@@ -378,11 +406,10 @@ mod tests {
 
             if v.is_ok() {
                 assert_eq!(
-                    get_field(&parsed.unwrap(), "field")
-                        .unwrap()
-                        .unwrap()
-                        .to_owned(),
-                    v.unwrap()
+                    parsed.unwrap(),
+                    Value::from(btreemap! {
+                        "field" =>  v.unwrap(),
+                    })
                 );
             } else {
                 assert_eq!(parsed, v);
@@ -474,17 +501,20 @@ mod tests {
         let rules = parse_grok_rules(
             &[],
             &[
-                r#"simple %{integer:some.nested.field} %{notSpace:some.nested.field:uppercase} %{notSpace:some.nested.field:nullIf("-")}"#
+                r#"simple %{integer:nested.field} %{notSpace:nested.field:uppercase} %{notSpace:nested.field:nullIf("-")}"#
                     .to_string(),
             ],
         )
             .expect("should parse rules");
         let parsed = parse_grok("1 info -", &rules).unwrap();
 
-        let value = get_field(&parsed, &LookupBuf::from_str("some.nested.field").unwrap());
         assert_eq!(
-            *value.expect("ok").expect("value"),
-            Value::Array(vec![1.into(), "INFO".into(), Value::Null])
+            parsed,
+            Value::from(btreemap! {
+                "nested" => btreemap! {
+                   "field" =>  Value::Array(vec![1.into(), "INFO".into(), Value::Null]),
+                },
+            })
         );
     }
 }
