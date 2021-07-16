@@ -1,0 +1,23 @@
+tasks:
+  - name: Dependencies
+    init: |
+      sudo apt update && DEBIAN_FRONTEND=noninteractive sudo apt install -y libsasl2-dev
+  - name: Build
+    init: cargo build
+  - name: Test
+    init: cargo test
+  - name: Clippy
+    init: cargo clippy
+  - name: Release
+    init: cargo build --release
+vscode:
+  extensions:
+    - matklad.rust-analyzer
+    - serayuzgur.crates
+    - eamodio.gitlens
+    - editorconfig.editorconfig
+github:
+  prebuilds:
+    branches: true
+    pullRequestsFromForks: true
+    addLabel: prebuilt-in-gitpod
