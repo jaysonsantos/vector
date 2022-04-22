@@ -36,10 +36,19 @@ impl Function for IsObject {
         ]
     }
 
-    fn compile(&self, mut arguments: ArgumentList) -> Compiled {
+    fn compile(
+        &self,
+        _state: (&mut state::LocalEnv, &mut state::ExternalEnv),
+        _ctx: &mut FunctionCompileContext,
+        mut arguments: ArgumentList,
+    ) -> Compiled {
         let value = arguments.required("value");
 
         Ok(Box::new(IsObjectFn { value }))
+    }
+
+    fn call_by_vm(&self, _ctx: &mut Context, args: &mut VmArgumentList) -> Resolved {
+        Ok(value!(args.required("value").is_object()))
     }
 }
 
@@ -53,8 +62,8 @@ impl Expression for IsObjectFn {
         self.value.resolve(ctx).map(|v| value!(v.is_object()))
     }
 
-    fn type_def(&self, _: &state::Compiler) -> TypeDef {
-        TypeDef::new().infallible().boolean()
+    fn type_def(&self, _: (&state::LocalEnv, &state::ExternalEnv)) -> TypeDef {
+        TypeDef::boolean().infallible()
     }
 }
 
@@ -68,13 +77,13 @@ mod tests {
         bytes {
             args: func_args![value: value!("foobar")],
             want: Ok(value!(false)),
-            tdef: TypeDef::new().infallible().boolean(),
+            tdef: TypeDef::boolean().infallible(),
         }
 
         object {
             args: func_args![value: value!({"foo": "bar"})],
             want: Ok(value!(true)),
-            tdef: TypeDef::new().infallible().boolean(),
+            tdef: TypeDef::boolean().infallible(),
         }
     ];
 }

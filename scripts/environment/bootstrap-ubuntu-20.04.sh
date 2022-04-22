@@ -23,6 +23,7 @@ apt install --yes \
     cmake \
     cmark-gfm \
     curl \
+    docker-compose \
     gawk \
     gnupg2 \
     gnupg-agent \
@@ -48,10 +49,10 @@ apt install --yes \
 # Cue
 TEMP=$(mktemp -d)
 curl \
-    -L https://github.com/cue-lang/cue/releases/download/v0.4.0/cue_v0.4.0_linux_amd64.tar.gz \
-    -o "${TEMP}/cue_v0.4.0_linux_amd64.tar.gz"
+    -L https://github.com/cue-lang/cue/releases/download/v0.4.2/cue_v0.4.2_linux_amd64.tar.gz \
+    -o "${TEMP}/cue_v0.4.2_linux_amd64.tar.gz"
 tar \
-    -xvf "${TEMP}/cue_v0.4.0_linux_amd64.tar.gz" \
+    -xvf "${TEMP}/cue_v0.4.2_linux_amd64.tar.gz" \
     -C "${TEMP}"
 cp "${TEMP}/cue" /usr/bin/cue
 
@@ -59,7 +60,7 @@ cp "${TEMP}/cue" /usr/bin/cue
 # Grease is used for the `make release-github` task.
 TEMP=$(mktemp -d)
 curl \
-    -L https://github.com/timberio/grease/releases/download/v1.0.1/grease-1.0.1-linux-amd64.tar.gz \
+    -L https://github.com/vectordotdev/grease/releases/download/v1.0.1/grease-1.0.1-linux-amd64.tar.gz \
     -o "${TEMP}/grease-1.0.1-linux-amd64.tar.gz"
 tar \
     -xvf "${TEMP}/grease-1.0.1-linux-amd64.tar.gz" \
@@ -80,6 +81,8 @@ fi
 # by our own Ubuntu 20.04 images, so this is really just make sure the path is configured.
 if [ -n "${CI-}" ] ; then
     echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+    # we often run into OOM issues in CI due to the low memory vs. CPU ratio on c5 instances
+    echo "CARGO_BUILD_JOBS=$(($(nproc) /2))" >> "${GITHUB_ENV}"
 else
     echo "export PATH=\"$HOME/.cargo/bin:\$PATH\"" >> "${HOME}/.bash_profile"
 fi

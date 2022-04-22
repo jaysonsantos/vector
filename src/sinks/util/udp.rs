@@ -1,31 +1,34 @@
-use super::SinkBuildError;
-use crate::udp;
-use crate::{
-    buffers::Acker,
-    config::SinkContext,
-    dns,
-    event::Event,
-    internal_events::{
-        SocketEventsSent, SocketMode, UdpSendIncomplete, UdpSocketConnectionEstablished,
-        UdpSocketConnectionFailed, UdpSocketError,
-    },
-    sinks::{
-        util::{retries::ExponentialBackoff, EncodedEvent, StreamSink},
-        Healthcheck, VectorSink,
-    },
-};
-use async_trait::async_trait;
-use bytes::Bytes;
-use futures::{future::BoxFuture, ready, stream::BoxStream, FutureExt, StreamExt};
-use serde::{Deserialize, Serialize};
-use snafu::{ResultExt, Snafu};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
+
+use async_trait::async_trait;
+use bytes::BytesMut;
+use futures::{future::BoxFuture, ready, stream::BoxStream, FutureExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use snafu::{ResultExt, Snafu};
 use tokio::{net::UdpSocket, sync::oneshot, time::sleep};
+use tokio_util::codec::Encoder;
+use vector_buffers::Acker;
+
+use super::SinkBuildError;
+use crate::{
+    config::SinkContext,
+    dns,
+    event::Event,
+    internal_events::{
+        SocketEventsSent, SocketMode, UdpSendIncompleteError, UdpSocketConnectionError,
+        UdpSocketConnectionEstablished, UdpSocketError,
+    },
+    sinks::{
+        util::{encoding::Transformer, retries::ExponentialBackoff, StreamSink},
+        Healthcheck, VectorSink,
+    },
+    udp,
+};
 
 #[derive(Debug, Snafu)]
 pub enum UdpError {
@@ -44,14 +47,13 @@ pub enum UdpError {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct UdpSinkConfig {
     address: String,
     send_buffer_bytes: Option<usize>,
 }
 
 impl UdpSinkConfig {
-    pub fn from_address(address: String) -> Self {
+    pub const fn from_address(address: String) -> Self {
         Self {
             address,
             send_buffer_bytes: None,
@@ -76,12 +78,13 @@ impl UdpSinkConfig {
     pub fn build(
         &self,
         cx: SinkContext,
-        encode_event: impl Fn(Event) -> Option<EncodedEvent<Bytes>> + Send + Sync + 'static,
+        transformer: Transformer,
+        encoder: impl Encoder<Event, Error = codecs::encoding::Error> + Clone + Send + Sync + 'static,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
         let connector = self.build_connector(cx.clone())?;
-        let sink = UdpSink::new(connector.clone(), cx.acker(), encode_event);
+        let sink = UdpSink::new(connector.clone(), cx.acker(), transformer, encoder);
         Ok((
-            VectorSink::Stream(Box::new(sink)),
+            VectorSink::from_event_streamsink(sink),
             async move { connector.healthcheck().await }.boxed(),
         ))
     }
@@ -95,7 +98,7 @@ struct UdpConnector {
 }
 
 impl UdpConnector {
-    fn new(host: String, port: u16, send_buffer_bytes: Option<usize>) -> Self {
+    const fn new(host: String, port: u16, send_buffer_bytes: Option<usize>) -> Self {
         Self {
             host,
             port,
@@ -103,7 +106,7 @@ impl UdpConnector {
         }
     }
 
-    fn fresh_backoff() -> ExponentialBackoff {
+    const fn fresh_backoff() -> ExponentialBackoff {
         // TODO: make configurable
         ExponentialBackoff::from_millis(2)
             .factor(250)
@@ -114,14 +117,14 @@ impl UdpConnector {
         let ip = dns::Resolver
             .lookup_ip(self.host.clone())
             .await
-            .context(DnsError)?
+            .context(DnsSnafu)?
             .next()
             .ok_or(UdpError::NoAddresses)?;
 
         let addr = SocketAddr::new(ip, self.port);
         let bind_address = find_bind_address(&addr);
 
-        let socket = UdpSocket::bind(bind_address).await.context(BindError)?;
+        let socket = UdpSocket::bind(bind_address).await.context(BindSnafu)?;
 
         if let Some(send_buffer_bytes) = self.send_buffer_bytes {
             if let Err(error) = udp::set_send_buffer_size(&socket, send_buffer_bytes) {
@@ -129,7 +132,7 @@ impl UdpConnector {
             }
         }
 
-        socket.connect(addr).await.context(ConnectError)?;
+        socket.connect(addr).await.context(ConnectSnafu)?;
 
         Ok(socket)
     }
@@ -143,7 +146,7 @@ impl UdpConnector {
                     return socket;
                 }
                 Err(error) => {
-                    emit!(UdpSocketConnectionFailed { error });
+                    emit!(UdpSocketConnectionError { error });
                     sleep(backoff.next().unwrap()).await;
                 }
             }
@@ -168,7 +171,7 @@ pub struct UdpService {
 }
 
 impl UdpService {
-    fn new(connector: UdpConnector) -> Self {
+    const fn new(connector: UdpConnector) -> Self {
         Self {
             connector,
             state: UdpServiceState::Disconnected,
@@ -176,7 +179,7 @@ impl UdpService {
     }
 }
 
-impl tower::Service<Bytes> for UdpService {
+impl tower::Service<BytesMut> for UdpService {
     type Response = ();
     type Error = UdpError;
     type Future = BoxFuture<'static, Result<(), Self::Error>>;
@@ -196,7 +199,7 @@ impl tower::Service<Bytes> for UdpService {
                 }
                 UdpServiceState::Connected(_) => break,
                 UdpServiceState::Sending(fut) => {
-                    let socket = match ready!(fut.poll_unpin(cx)).context(ServiceChannelRecvError) {
+                    let socket = match ready!(fut.poll_unpin(cx)).context(ServiceChannelRecvSnafu) {
                         Ok(socket) => socket,
                         Err(error) => return Poll::Ready(Err(error)),
                     };
@@ -207,7 +210,7 @@ impl tower::Service<Bytes> for UdpService {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, msg: Bytes) -> Self::Future {
+    fn call(&mut self, msg: BytesMut) -> Self::Future {
         let (sender, receiver) = oneshot::channel();
 
         let mut socket =
@@ -218,53 +221,63 @@ impl tower::Service<Bytes> for UdpService {
 
         Box::pin(async move {
             // TODO: Add reconnect support as TCP/Unix?
-            let result = udp_send(&mut socket, &msg).await.context(SendError);
+            let result = udp_send(&mut socket, &msg).await.context(SendSnafu);
             let _ = sender.send(socket);
             result
         })
     }
 }
 
-struct UdpSink {
+struct UdpSink<E>
+where
+    E: Encoder<Event, Error = codecs::encoding::Error> + Clone + Send + Sync,
+{
     connector: UdpConnector,
     acker: Acker,
-    encode_event: Box<dyn Fn(Event) -> Option<EncodedEvent<Bytes>> + Send + Sync>,
+    transformer: Transformer,
+    encoder: E,
 }
 
-impl UdpSink {
-    fn new(
-        connector: UdpConnector,
-        acker: Acker,
-        encode_event: impl Fn(Event) -> Option<EncodedEvent<Bytes>> + Send + Sync + 'static,
-    ) -> Self {
+impl<E> UdpSink<E>
+where
+    E: Encoder<Event, Error = codecs::encoding::Error> + Clone + Send + Sync,
+{
+    fn new(connector: UdpConnector, acker: Acker, transformer: Transformer, encoder: E) -> Self {
         Self {
             connector,
             acker,
-            encode_event: Box::new(encode_event),
+            transformer,
+            encoder,
         }
     }
 }
 
 #[async_trait]
-impl StreamSink for UdpSink {
-    async fn run(&mut self, input: BoxStream<'_, Event>) -> Result<(), ()> {
+impl<E> StreamSink<Event> for UdpSink<E>
+where
+    E: Encoder<Event, Error = codecs::encoding::Error> + Clone + Send + Sync,
+{
+    async fn run(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         let mut input = input.peekable();
 
+        let mut encoder = self.encoder.clone();
         while Pin::new(&mut input).peek().await.is_some() {
             let mut socket = self.connector.connect_backoff().await;
-            while let Some(event) = input.next().await {
+            while let Some(mut event) = input.next().await {
                 self.acker.ack(1);
 
-                let input = match (self.encode_event)(event) {
-                    Some(input) => input,
-                    None => continue,
-                };
+                self.transformer.transform(&mut event);
 
-                match udp_send(&mut socket, &input.item).await {
+                let mut bytes = BytesMut::new();
+                if encoder.encode(event, &mut bytes).is_err() {
+                    continue;
+                }
+
+                match udp_send(&mut socket, &bytes).await {
                     Ok(()) => emit!(SocketEventsSent {
                         mode: SocketMode::Udp,
                         count: 1,
-                        byte_size: input.item.len(),
+                        byte_size: bytes.len(),
                     }),
                     Err(error) => {
                         emit!(UdpSocketError { error });
@@ -281,7 +294,7 @@ impl StreamSink for UdpSink {
 async fn udp_send(socket: &mut UdpSocket, buf: &[u8]) -> tokio::io::Result<()> {
     let sent = socket.send(buf).await?;
     if sent != buf.len() {
-        emit!(UdpSendIncomplete {
+        emit!(UdpSendIncompleteError {
             data_size: buf.len(),
             sent,
         });

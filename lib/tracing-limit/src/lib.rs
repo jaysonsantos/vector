@@ -1,5 +1,6 @@
-use dashmap::DashMap;
 use std::fmt;
+
+use dashmap::DashMap;
 use tracing_core::{
     callsite::Identifier,
     field::{display, Field, Value, Visit},
@@ -13,18 +14,18 @@ use tracing_subscriber::layer::{Context, Layer};
 #[macro_use]
 extern crate tracing;
 
-#[cfg(test)]
-use mock_instant::Instant;
-
 #[cfg(not(test))]
 use std::time::Instant;
+
+#[cfg(test)]
+use mock_instant::Instant;
 
 const RATE_LIMIT_SECS_FIELD: &str = "internal_log_rate_secs";
 const MESSAGE_FIELD: &str = "message";
 
 // These fields will cause events to be independently rate limited by the values
 // for these keys
-const COMPONENT_NAME_FIELD: &str = "component_name";
+const COMPONENT_ID_FIELD: &str = "component_id";
 const VRL_LINE_NUMBER: &str = "vrl_line_number";
 const VRL_POSITION: &str = "vrl_position";
 
@@ -75,7 +76,7 @@ where
     }
 
     // keep track of any span fields we use for grouping rate limiting
-    fn new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
         {
             let span = ctx.span(id).expect("Span not found, this is a bug");
             let mut extensions = span.extensions_mut();
@@ -86,7 +87,7 @@ where
                 extensions.insert(fields);
             };
         }
-        self.inner.new_span(attrs, id, ctx);
+        self.inner.on_new_span(attrs, id, ctx);
     }
 
     // keep track of any span fields we use for grouping rate limiting
@@ -170,7 +171,7 @@ where
             // check and increment the current count
             // if 0: this is the first message, just pass it through
             // if 1: this is the first rate limited message
-            // otherwise supress it until the rate limit expires
+            // otherwise suppress it until the rate limit expires
             match prev {
                 0 => self.inner.on_event(event, ctx),
                 1 => {
@@ -219,6 +220,11 @@ where
     #[inline]
     fn on_id_change(&self, old: &span::Id, new: &span::Id, ctx: Context<'_, S>) {
         self.inner.on_id_change(old, new, ctx);
+    }
+
+    #[inline]
+    fn on_layer(&mut self, subscriber: &mut S) {
+        self.inner.on_layer(subscriber);
     }
 }
 
@@ -309,7 +315,7 @@ impl From<String> for TraceValue {
 /// rate limited separately.
 #[derive(Default, Eq, PartialEq, Hash, Clone)]
 struct RateLimitedSpanKeys {
-    component_name: Option<TraceValue>,
+    component_id: Option<TraceValue>,
     vrl_line_number: Option<TraceValue>,
     vrl_position: Option<TraceValue>,
 }
@@ -317,7 +323,7 @@ struct RateLimitedSpanKeys {
 impl RateLimitedSpanKeys {
     fn record(&mut self, field: &Field, value: TraceValue) {
         match field.name() {
-            COMPONENT_NAME_FIELD => self.component_name = Some(value),
+            COMPONENT_ID_FIELD => self.component_id = Some(value),
             VRL_LINE_NUMBER => self.vrl_line_number = Some(value),
             VRL_POSITION => self.vrl_position = Some(value),
             _ => {}
@@ -325,8 +331,8 @@ impl RateLimitedSpanKeys {
     }
 
     fn merge(&mut self, other: &Self) {
-        if let Some(component_name) = &other.component_name {
-            self.component_name = Some(component_name.clone());
+        if let Some(component_id) = &other.component_id {
+            self.component_id = Some(component_id.clone());
         }
         if let Some(vrl_line_number) = &other.vrl_line_number {
             self.vrl_line_number = Some(vrl_line_number.clone());
@@ -374,7 +380,6 @@ impl Visit for LimitVisitor {
 
     fn record_i64(&mut self, field: &Field, value: i64) {
         if field.name() == RATE_LIMIT_SECS_FIELD {
-            use std::convert::TryFrom;
             self.limit = Some(u64::try_from(value).unwrap_or_default());
         }
     }
@@ -394,13 +399,15 @@ impl Visit for LimitVisitor {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use mock_instant::MockClock;
     use std::{
         sync::{Arc, Mutex},
         time::Duration,
     };
+
+    use mock_instant::MockClock;
     use tracing_subscriber::layer::SubscriberExt;
+
+    use super::*;
 
     #[derive(Default)]
     struct RecordingLayer<S> {
@@ -484,11 +491,8 @@ mod test {
             for _ in 0..21 {
                 for key in &["foo", "bar"] {
                     for line_number in &[1, 2] {
-                        let span = info_span!(
-                            "span",
-                            component_name = &key,
-                            vrl_line_number = &line_number
-                        );
+                        let span =
+                            info_span!("span", component_id = &key, vrl_line_number = &line_number);
                         let _enter = span.enter();
                         info!(
                             message =

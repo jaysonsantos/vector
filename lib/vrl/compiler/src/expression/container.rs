@@ -1,10 +1,14 @@
-use crate::expression::{Array, Block, Group, Object, Resolved, Value};
-use crate::{Context, Expression, State, TypeDef};
 use std::fmt;
+
+use crate::{
+    expression::{Array, Block, Group, Object, Resolved, Value},
+    state::{ExternalEnv, LocalEnv},
+    Context, Expression, TypeDef,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Container {
-    pub(crate) variant: Variant,
+    pub variant: Variant,
 }
 
 impl Container {
@@ -44,7 +48,7 @@ impl Expression for Container {
         }
     }
 
-    fn type_def(&self, state: &State) -> TypeDef {
+    fn type_def(&self, state: (&LocalEnv, &ExternalEnv)) -> TypeDef {
         use Variant::*;
 
         match &self.variant {
@@ -52,6 +56,22 @@ impl Expression for Container {
             Block(v) => v.type_def(state),
             Array(v) => v.type_def(state),
             Object(v) => v.type_def(state),
+        }
+    }
+
+    fn compile_to_vm(
+        &self,
+        vm: &mut crate::vm::Vm,
+        state: (&mut LocalEnv, &mut ExternalEnv),
+    ) -> Result<(), String> {
+        use Variant::*;
+
+        // Pass the call on to the contained expression.
+        match &self.variant {
+            Group(v) => v.compile_to_vm(vm, state),
+            Block(v) => v.compile_to_vm(vm, state),
+            Array(v) => v.compile_to_vm(vm, state),
+            Object(v) => v.compile_to_vm(vm, state),
         }
     }
 }

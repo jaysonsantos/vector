@@ -1,4 +1,4 @@
-FROM alpine:3.12 AS builder
+FROM alpine:3.14 AS builder
 
 WORKDIR /vector
 
@@ -9,7 +9,6 @@ FROM gcr.io/distroless/static
 
 COPY --from=builder /vector/bin/* /usr/local/bin/
 COPY --from=builder /vector/config/vector.toml /etc/vector/vector.toml
-VOLUME /var/lib/vector/
 
 # Smoke test
 RUN ["vector", "--version"]

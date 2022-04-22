@@ -18,12 +18,17 @@ impl Function for OnlyFields {
         }
     }
 
-    fn compile(&self, mut arguments: ArgumentList) -> Compiled {
+    fn compile(
+        &self,
+        _state: (&mut state::LocalEnv, &mut state::ExternalEnv),
+        _ctx: &mut FunctionCompileContext,
+        mut arguments: ArgumentList,
+    ) -> Compiled {
         let mut paths = vec![];
         paths.push(arguments.required_path("1")?);
 
         for i in 2..=16 {
-            if let Some(path) = arguments.optional_path(&format!("{}", i))? {
+            if let Some(path) = arguments.optional_path(&i.to_string())? {
                 paths.push(path)
             }
         }
@@ -51,10 +56,10 @@ impl Expression for OnlyFieldsFn {
         Ok(Value::Null)
     }
 
-    fn type_def(&self, _: &state::Compiler) -> TypeDef {
+    fn type_def(&self, _: (&state::LocalEnv, &state::ExternalEnv)) -> TypeDef {
         TypeDef {
             fallible: true,
-            kind: value::Kind::Null,
+            kind: value::Kind::null(),
             ..Default::default()
         }
     }
@@ -70,7 +75,7 @@ mod tests {
         },
         def: TypeDef {
             fallible: true,
-            kind: value::Kind::Null,
+            kind: value::Kind::null(),
             ..Default::default()
         },
     }];

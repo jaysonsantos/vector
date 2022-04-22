@@ -10,6 +10,11 @@
 
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
+#![deny(unreachable_pub)]
+#![deny(unused_allocation)]
+#![deny(unused_extern_crates)]
+#![deny(unused_assignments)]
+#![deny(unused_comparisons)]
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::default_trait_access)] // triggers on generated prost code
@@ -21,28 +26,35 @@
 #![allow(clippy::unnested_or_patterns)] // nightly-only feature as of 1.51.0
 #![allow(clippy::type_complexity)] // long-types happen, especially in async code
 
-#[cfg(feature = "api")]
-pub mod api;
 pub mod config;
 pub mod event;
-pub mod mapping;
+pub mod fanout;
 pub mod metrics;
+pub mod schema;
 pub mod sink;
 pub mod source;
 #[cfg(test)]
 mod test_util;
 pub mod transform;
-pub use buffers;
-mod byte_size_of;
+pub use vector_buffers as buffers;
+pub mod partition;
+pub mod serde;
+pub mod stream;
+pub mod time;
+use std::path::PathBuf;
 
-pub use byte_size_of::ByteSizeOf;
+#[cfg(any(test, feature = "test"))]
+pub use vector_common::event_test_util;
+pub use vector_common::{byte_size_of::ByteSizeOf, internal_event};
 
 #[macro_use]
 extern crate derivative;
 #[macro_use]
-extern crate pest_derive;
-#[macro_use]
 extern crate tracing;
+
+pub fn default_data_dir() -> Option<PathBuf> {
+    Some(PathBuf::from("/var/lib/vector/"))
+}
 
 /// Vector's basic error type, dynamically dispatched and safe to send across
 /// threads.

@@ -1,7 +1,9 @@
-use crate::event::{Metric, MetricValue};
-use crate::sources;
-use crate::sources::host_metrics::HostMetricsConfig;
 use async_graphql::Object;
+
+use crate::{
+    event::{Metric, MetricValue},
+    sources::host_metrics,
+};
 
 pub struct MemoryMetrics(Vec<Metric>);
 
@@ -257,12 +259,13 @@ impl DiskMetrics {
     }
 }
 
-pub struct HostMetrics(HostMetricsConfig);
+pub struct HostMetrics(host_metrics::HostMetrics);
 
 impl HostMetrics {
-    /// Primes the host metrics pump by passing through a new `HostMetricsConfig`
+    /// Primes the host metrics pump by passing through a new `HostMetrics`
     pub fn new() -> Self {
-        Self(sources::host_metrics::HostMetricsConfig::default())
+        let config = host_metrics::HostMetricsConfig::default();
+        Self(host_metrics::HostMetrics::new(config))
     }
 }
 

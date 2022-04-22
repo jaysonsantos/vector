@@ -1,29 +1,31 @@
-use super::{healthcheck_response, GcpAuthConfig, GcpCredentials, Scope};
-use crate::template::TemplateRenderingError;
-use crate::{
-    config::{log_schema, DataType, SinkConfig, SinkContext, SinkDescription},
-    event::{Event, Value},
-    http::HttpClient,
-    internal_events::TemplateRenderingFailed,
-    sinks::{
-        util::{
-            encoding::{EncodingConfigWithDefault, EncodingConfiguration},
-            http::{BatchedHttpSink, HttpSink},
-            BatchConfig, BatchSettings, BoxedRawValue, EncodedEvent, JsonArrayBuffer,
-            TowerRequestConfig,
-        },
-        Healthcheck, VectorSink,
-    },
-    template::Template,
-    tls::{TlsOptions, TlsSettings},
-};
+use std::collections::HashMap;
+
+use bytes::Bytes;
 use futures::{FutureExt, SinkExt};
 use http::{Request, Uri};
 use hyper::Body;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, map};
 use snafu::Snafu;
-use std::collections::HashMap;
+
+use super::{GcpAuthConfig, GcpCredentials, Scope};
+use crate::{
+    config::{log_schema, AcknowledgementsConfig, Input, SinkConfig, SinkContext, SinkDescription},
+    event::{Event, Value},
+    http::HttpClient,
+    sinks::{
+        gcs_common::config::healthcheck_response,
+        util::{
+            encoding::{EncodingConfigWithDefault, EncodingConfiguration},
+            http::{BatchedHttpSink, HttpEventEncoder, HttpSink},
+            BatchConfig, BoxedRawValue, JsonArrayBuffer, RealtimeSizeBasedDefaultBatchSettings,
+            TowerRequestConfig,
+        },
+        Healthcheck, VectorSink,
+    },
+    template::{Template, TemplateRenderingError},
+    tls::{TlsOptions, TlsSettings},
+};
 
 #[derive(Debug, Snafu)]
 enum HealthcheckError {
@@ -50,11 +52,18 @@ pub struct StackdriverConfig {
     pub encoding: EncodingConfigWithDefault<Encoding>,
 
     #[serde(default)]
-    pub batch: BatchConfig,
+    pub batch: BatchConfig<RealtimeSizeBasedDefaultBatchSettings>,
     #[serde(default)]
     pub request: TowerRequestConfig,
 
     pub tls: Option<TlsOptions>,
+
+    #[serde(
+        default,
+        deserialize_with = "crate::serde::bool_or_struct",
+        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+    )]
+    acknowledgements: AcknowledgementsConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +73,9 @@ struct StackdriverSink {
     severity_key: Option<String>,
     uri: Uri,
 }
+
+// 10MB limit for entries.write: https://cloud.google.com/logging/quotas#api-limits
+const MAX_BATCH_PAYLOAD_SIZE: usize = 10_000_000;
 
 #[derive(Deserialize, Serialize, Debug, Eq, PartialEq, Clone, Derivative)]
 #[serde(rename_all = "snake_case")]
@@ -109,10 +121,11 @@ impl SinkConfig for StackdriverConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let creds = self.auth.make_credentials(Scope::LoggingWrite).await?;
 
-        let batch = BatchSettings::default()
-            .bytes(bytesize::kib(5000u64))
-            .timeout(1)
-            .parse_config(self.batch)?;
+        let batch = self
+            .batch
+            .validate()?
+            .limit_max_bytes(MAX_BATCH_PAYLOAD_SIZE)?
+            .into_batch_settings()?;
         let request = self.request.unwrap_with(&TowerRequestConfig {
             rate_limit_num: Some(1000),
             rate_limit_duration_secs: Some(1),
@@ -140,30 +153,35 @@ impl SinkConfig for StackdriverConfig {
         )
         .sink_map_err(|error| error!(message = "Fatal gcp_stackdriver_logs sink error.", %error));
 
-        Ok((VectorSink::Sink(Box::new(sink)), healthcheck))
+        Ok((VectorSink::from_event_sink(sink), healthcheck))
     }
 
-    fn input_type(&self) -> DataType {
-        DataType::Log
+    fn input(&self) -> Input {
+        Input::log()
     }
 
     fn sink_type(&self) -> &'static str {
         "gcp_stackdriver_logs"
     }
+
+    fn acknowledgements(&self) -> Option<&AcknowledgementsConfig> {
+        Some(&self.acknowledgements)
+    }
 }
 
-#[async_trait::async_trait]
-impl HttpSink for StackdriverSink {
-    type Input = serde_json::Value;
-    type Output = Vec<BoxedRawValue>;
+struct StackdriverEventEncoder {
+    config: StackdriverConfig,
+    severity_key: Option<String>,
+}
 
-    fn encode_event(&self, event: Event) -> Option<EncodedEvent<Self::Input>> {
+impl HttpEventEncoder<serde_json::Value> for StackdriverEventEncoder {
+    fn encode_event(&mut self, event: Event) -> Option<serde_json::Value> {
         let mut labels = HashMap::with_capacity(self.config.resource.labels.len());
         for (key, template) in &self.config.resource.labels {
             let value = template
                 .render_string(&event)
                 .map_err(|error| {
-                    emit!(TemplateRenderingFailed {
+                    emit!(crate::internal_events::TemplateRenderingError {
                         error,
                         field: Some("resource.labels"),
                         drop_event: true,
@@ -176,7 +194,7 @@ impl HttpSink for StackdriverSink {
             .config
             .log_name(&event)
             .map_err(|error| {
-                emit!(TemplateRenderingFailed {
+                emit!(crate::internal_events::TemplateRenderingError {
                     error,
                     field: Some("log_id"),
                     drop_event: true,
@@ -188,7 +206,7 @@ impl HttpSink for StackdriverSink {
         let severity = self
             .severity_key
             .as_ref()
-            .and_then(|key| log.remove(key))
+            .and_then(|key| log.remove(key.as_str()))
             .map(remap_severity)
             .unwrap_or_else(|| 0.into());
 
@@ -214,13 +232,27 @@ impl HttpSink for StackdriverSink {
             entry.insert("timestamp".into(), json!(timestamp));
         }
 
-        Some(EncodedEvent::new(json!(entry)).with_metadata(log))
+        Some(json!(entry))
+    }
+}
+
+#[async_trait::async_trait]
+impl HttpSink for StackdriverSink {
+    type Input = serde_json::Value;
+    type Output = Vec<BoxedRawValue>;
+    type Encoder = StackdriverEventEncoder;
+
+    fn build_encoder(&self) -> Self::Encoder {
+        StackdriverEventEncoder {
+            config: self.config.clone(),
+            severity_key: self.severity_key.clone(),
+        }
     }
 
-    async fn build_request(&self, events: Self::Output) -> crate::Result<Request<Vec<u8>>> {
+    async fn build_request(&self, events: Self::Output) -> crate::Result<Request<Bytes>> {
         let events = serde_json::json!({ "entries": events });
 
-        let body = serde_json::to_vec(&events).unwrap();
+        let body = crate::serde::json::to_bytes(&events).unwrap().freeze();
 
         let mut request = Request::post(self.uri.clone())
             .header("Content-Type", "application/json")
@@ -246,7 +278,7 @@ fn remap_severity(severity: Value) -> Value {
                     s if s.starts_with("EMERG") || s.starts_with("FATAL") => 800,
                     s if s.starts_with("ALERT") => 700,
                     s if s.starts_with("CRIT") => 600,
-                    s if s.starts_with("ERR") => 500,
+                    s if s.starts_with("ERR") || s == "ER" => 500,
                     s if s.starts_with("WARN") => 400,
                     s if s.starts_with("NOTICE") => 300,
                     s if s.starts_with("INFO") => 200,
@@ -299,11 +331,12 @@ impl StackdriverConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::event::{LogEvent, Value};
     use chrono::{TimeZone, Utc};
     use indoc::indoc;
     use serde_json::value::RawValue;
+
+    use super::*;
+    use crate::event::{LogEvent, Value};
 
     #[test]
     fn generate_config() {
@@ -328,6 +361,7 @@ mod tests {
             severity_key: Some("anumber".into()),
             uri: ENDPOINT_URI.parse().unwrap(),
         };
+        let mut encoder = sink.build_encoder();
 
         let log = [
             ("message", "hello world"),
@@ -338,7 +372,7 @@ mod tests {
         .iter()
         .copied()
         .collect::<LogEvent>();
-        let json = sink.encode_event(Event::from(log)).unwrap().item;
+        let json = encoder.encode_event(Event::from(log)).unwrap();
         assert_eq!(
             json,
             serde_json::json!({
@@ -369,6 +403,7 @@ mod tests {
             severity_key: Some("anumber".into()),
             uri: ENDPOINT_URI.parse().unwrap(),
         };
+        let mut encoder = sink.build_encoder();
 
         let mut log = LogEvent::default();
         log.insert("message", Value::Bytes("hello world".into()));
@@ -378,7 +413,7 @@ mod tests {
             Value::Timestamp(Utc.ymd(2020, 1, 1).and_hms(12, 30, 0)),
         );
 
-        let json = sink.encode_event(Event::from(log)).unwrap().item;
+        let json = encoder.encode_event(Event::from(log)).unwrap();
         assert_eq!(
             json,
             serde_json::json!({
@@ -437,11 +472,12 @@ mod tests {
             severity_key: None,
             uri: ENDPOINT_URI.parse().unwrap(),
         };
+        let mut encoder = sink.build_encoder();
 
         let log1 = [("message", "hello")].iter().copied().collect::<LogEvent>();
         let log2 = [("message", "world")].iter().copied().collect::<LogEvent>();
-        let event1 = sink.encode_event(Event::from(log1)).unwrap().item;
-        let event2 = sink.encode_event(Event::from(log2)).unwrap().item;
+        let event1 = encoder.encode_event(Event::from(log1)).unwrap();
+        let event2 = encoder.encode_event(Event::from(log2)).unwrap();
 
         let json1 = serde_json::to_string(&event1).unwrap();
         let json2 = serde_json::to_string(&event2).unwrap();

@@ -1,12 +1,17 @@
-use crate::{
-    config::{DataType, GenerateConfig, GlobalOptions, TransformConfig, TransformDescription},
-    event::Event,
-    internal_events::{RenameFieldsFieldDoesNotExist, RenameFieldsFieldOverwritten},
-    serde::Fields,
-    transforms::{FunctionTransform, Transform},
-};
 use indexmap::map::IndexMap;
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    config::{
+        DataType, GenerateConfig, Input, Output, TransformConfig, TransformContext,
+        TransformDescription,
+    },
+    event::Event,
+    internal_events::{RenameFieldsFieldDoesNotExist, RenameFieldsFieldOverwritten},
+    schema,
+    serde::Fields,
+    transforms::{FunctionTransform, OutputBuffer, Transform},
+};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -34,7 +39,7 @@ impl GenerateConfig for RenameFieldsConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "rename_fields")]
 impl TransformConfig for RenameFieldsConfig {
-    async fn build(&self, _globals: &GlobalOptions) -> crate::Result<Transform> {
+    async fn build(&self, _context: &TransformContext) -> crate::Result<Transform> {
         let mut fields = IndexMap::default();
         for (key, value) in self.fields.clone().all_fields() {
             fields.insert(key.to_string(), value.to_string());
@@ -45,12 +50,12 @@ impl TransformConfig for RenameFieldsConfig {
         )?))
     }
 
-    fn input_type(&self) -> DataType {
-        DataType::Log
+    fn input(&self) -> Input {
+        Input::log()
     }
 
-    fn output_type(&self) -> DataType {
-        DataType::Log
+    fn outputs(&self, _: &schema::Definition) -> Vec<Output> {
+        vec![Output::default(DataType::Log)]
     }
 
     fn transform_type(&self) -> &'static str {
@@ -60,17 +65,17 @@ impl TransformConfig for RenameFieldsConfig {
 
 impl RenameFields {
     pub fn new(fields: IndexMap<String, String>, drop_empty: bool) -> crate::Result<Self> {
-        Ok(RenameFields { fields, drop_empty })
+        Ok(Self { fields, drop_empty })
     }
 }
 
 impl FunctionTransform for RenameFields {
-    fn transform(&mut self, output: &mut Vec<Event>, mut event: Event) {
+    fn transform(&mut self, output: &mut OutputBuffer, mut event: Event) {
         for (old_key, new_key) in &self.fields {
             let log = event.as_mut_log();
-            match log.remove_prune(&old_key, self.drop_empty) {
+            match log.remove_prune(old_key.as_str(), self.drop_empty) {
                 Some(v) => {
-                    if event.as_mut_log().insert(&new_key, v).is_some() {
+                    if event.as_mut_log().insert(new_key.as_str(), v).is_some() {
                         emit!(RenameFieldsFieldOverwritten { field: old_key });
                     }
                 }

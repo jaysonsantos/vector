@@ -1,5 +1,6 @@
-use crate::parse_syslog::ParseSyslogFn;
 use vrl::prelude::*;
+
+use crate::parse_syslog::ParseSyslogFn;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ParseLinuxAuthorization;
@@ -27,15 +28,25 @@ impl Function for ParseLinuxAuthorization {
                 "hostname": "localhost",
                 "message": "Accepted publickey for eng from 10.1.1.1 port 8888 ssh2: RSA SHA256:foobar",
                 "procid": 1111,
-                "timestamp": "2021-03-23T01:49:58Z"
+                "timestamp": "2022-03-23T01:49:58Z"
             }"#}),
         }]
     }
 
-    fn compile(&self, mut arguments: ArgumentList) -> Compiled {
+    fn compile(
+        &self,
+        _state: (&mut state::LocalEnv, &mut state::ExternalEnv),
+        _ctx: &mut FunctionCompileContext,
+        mut arguments: ArgumentList,
+    ) -> Compiled {
         let value = arguments.required("value");
 
         // The parse_linux_authorization function is just an alias for parse_syslog
         Ok(Box::new(ParseSyslogFn { value }))
+    }
+
+    fn call_by_vm(&self, ctx: &mut Context, args: &mut VmArgumentList) -> Resolved {
+        let value = args.required("value");
+        super::parse_syslog::parse_syslog(value, ctx)
     }
 }

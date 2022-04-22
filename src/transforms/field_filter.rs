@@ -1,9 +1,14 @@
-use crate::{
-    config::{DataType, GenerateConfig, GlobalOptions, TransformConfig, TransformDescription},
-    event::Event,
-    transforms::{FunctionTransform, Transform},
-};
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    config::{
+        DataType, GenerateConfig, Input, Output, TransformConfig, TransformContext,
+        TransformDescription,
+    },
+    event::Event,
+    schema,
+    transforms::{FunctionTransform, OutputBuffer, Transform},
+};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -29,7 +34,7 @@ impl GenerateConfig for FieldFilterConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "field_filter")]
 impl TransformConfig for FieldFilterConfig {
-    async fn build(&self, _globals: &GlobalOptions) -> crate::Result<Transform> {
+    async fn build(&self, _context: &TransformContext) -> crate::Result<Transform> {
         warn!(
             message =
                 r#"The "field_filter" transform is deprecated, use the "filter" transform instead"#
@@ -40,12 +45,12 @@ impl TransformConfig for FieldFilterConfig {
         )))
     }
 
-    fn input_type(&self) -> DataType {
-        DataType::Log
+    fn input(&self) -> Input {
+        Input::log()
     }
 
-    fn output_type(&self) -> DataType {
-        DataType::Log
+    fn outputs(&self, _: &schema::Definition) -> Vec<Output> {
+        vec![Output::default(DataType::Log)]
     }
 
     fn transform_type(&self) -> &'static str {
@@ -60,17 +65,17 @@ pub struct FieldFilter {
 }
 
 impl FieldFilter {
-    pub fn new(field_name: String, value: String) -> Self {
+    pub const fn new(field_name: String, value: String) -> Self {
         Self { field_name, value }
     }
 }
 
 impl FunctionTransform for FieldFilter {
-    fn transform(&mut self, output: &mut Vec<Event>, event: Event) {
+    fn transform(&mut self, output: &mut OutputBuffer, event: Event) {
         if event
             .as_log()
-            .get(&self.field_name)
-            .map(|f| f.as_bytes())
+            .get(self.field_name.as_str())
+            .map(|f| f.coerce_to_bytes())
             .map_or(false, |b| b == self.value.as_bytes())
         {
             output.push(event);

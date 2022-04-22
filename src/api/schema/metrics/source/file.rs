@@ -1,3 +1,7 @@
+use std::{cmp::Ordering, collections::BTreeMap};
+
+use async_graphql::{Enum, InputObject, Object};
+
 use crate::{
     api::schema::{
         filter::{filter_items, CustomFilter, StringFilter},
@@ -7,8 +11,6 @@ use crate::{
     event::Metric,
     filter_check,
 };
-use async_graphql::{Enum, InputObject, Object};
-use std::{cmp::Ordering, collections::BTreeMap};
 
 #[derive(Clone)]
 pub struct FileSourceMetricFile<'a> {
@@ -18,6 +20,7 @@ pub struct FileSourceMetricFile<'a> {
 
 impl<'a> FileSourceMetricFile<'a> {
     /// Returns a new FileSourceMetricFile from a (name, Vec<&Metric>) tuple
+    #[allow(clippy::missing_const_for_fn)] // const cannot run destructor
     fn from_tuple((name, metrics): (String, Vec<&'a Metric>)) -> Self {
         Self { name, metrics }
     }
@@ -49,9 +52,19 @@ impl<'a> FileSourceMetricFile<'a> {
         self.metrics.events_in_total()
     }
 
+    /// Metric indicating received events for the current file
+    async fn received_events_total(&self) -> Option<metrics::ReceivedEventsTotal> {
+        self.metrics.received_events_total()
+    }
+
     /// Metric indicating outgoing events for the current file
     async fn events_out_total(&self) -> Option<metrics::EventsOutTotal> {
         self.metrics.events_out_total()
+    }
+
+    /// Metric indicating outgoing events for the current file
+    async fn sent_events_total(&self) -> Option<metrics::SentEventsTotal> {
+        self.metrics.sent_events_total()
     }
 }
 
@@ -82,7 +95,9 @@ pub enum FileSourceMetricFilesSortFieldName {
     Name,
     ProcessedBytesTotal,
     ProcessedEventsTotal,
+    ReceivedEventsTotal,
     EventsInTotal,
+    SentEventsTotal,
     EventsOutTotal,
 }
 
@@ -112,6 +127,17 @@ impl sort::SortableByField<FileSourceMetricFilesSortFieldName> for FileSourceMet
                     .map(|m| m.get_processed_events_total() as i64)
                     .unwrap_or(0),
             ),
+            FileSourceMetricFilesSortFieldName::ReceivedEventsTotal => Ord::cmp(
+                &self
+                    .metrics
+                    .received_events_total()
+                    .map(|m| m.get_received_events_total() as i64)
+                    .unwrap_or(0),
+                &rhs.metrics
+                    .received_events_total()
+                    .map(|m| m.get_received_events_total() as i64)
+                    .unwrap_or(0),
+            ),
             FileSourceMetricFilesSortFieldName::EventsInTotal => Ord::cmp(
                 &self
                     .metrics
@@ -121,6 +147,17 @@ impl sort::SortableByField<FileSourceMetricFilesSortFieldName> for FileSourceMet
                 &rhs.metrics
                     .events_in_total()
                     .map(|m| m.get_events_in_total() as i64)
+                    .unwrap_or(0),
+            ),
+            FileSourceMetricFilesSortFieldName::SentEventsTotal => Ord::cmp(
+                &self
+                    .metrics
+                    .sent_events_total()
+                    .map(|m| m.get_sent_events_total() as i64)
+                    .unwrap_or(0),
+                &rhs.metrics
+                    .sent_events_total()
+                    .map(|m| m.get_sent_events_total() as i64)
                     .unwrap_or(0),
             ),
             FileSourceMetricFilesSortFieldName::EventsOutTotal => Ord::cmp(
@@ -170,7 +207,7 @@ impl FileSourceMetrics {
         filter: Option<FileSourceMetricsFilesFilter>,
         sort: Option<Vec<sort::SortField<FileSourceMetricFilesSortFieldName>>>,
     ) -> relay::ConnectionResult<FileSourceMetricFile<'_>> {
-        let filter = filter.unwrap_or_else(FileSourceMetricsFilesFilter::default);
+        let filter = filter.unwrap_or_default();
         let mut files = filter_items(self.get_files().into_iter(), &filter);
 
         if let Some(sort_fields) = sort {
@@ -200,17 +237,29 @@ impl FileSourceMetrics {
         self.0.events_in_total()
     }
 
+    /// Total received events for the current file source
+    pub async fn received_events_total(&self) -> Option<metrics::ReceivedEventsTotal> {
+        self.0.received_events_total()
+    }
+
     /// Total outgoing events for the current file source
     pub async fn events_out_total(&self) -> Option<metrics::EventsOutTotal> {
         self.0.events_out_total()
+    }
+
+    /// Total outgoing events for the current file source
+    pub async fn sent_events_total(&self) -> Option<metrics::SentEventsTotal> {
+        self.0.sent_events_total()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::schema::sort::SortField;
-    use crate::event::{MetricKind, MetricValue};
+    use crate::{
+        api::schema::sort::SortField,
+        event::{MetricKind, MetricValue},
+    };
 
     struct FileSourceMetricTest {
         name: &'static str,

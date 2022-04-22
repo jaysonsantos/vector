@@ -1,12 +1,15 @@
 #![cfg(all(feature = "sources-syslog", feature = "sinks-socket"))]
 
+use std::{collections::HashMap, fmt, str::FromStr};
+
 use bytes::Bytes;
 use rand::{thread_rng, Rng};
 use serde::Deserialize;
 use serde_json::Value;
-use sinks::socket::{self, SocketSinkConfig};
-use sinks::util::{encoding::EncodingConfig, tcp::TcpSinkConfig, Encoding};
-use std::{collections::HashMap, fmt, str::FromStr};
+use sinks::{
+    socket::{self, SocketSinkConfig},
+    util::{encoding::EncodingConfig, tcp::TcpSinkConfig, Encoding},
+};
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::BytesCodec;
@@ -34,6 +37,7 @@ async fn test_tcp_syslog() {
             keepalive: None,
             tls: None,
             receive_buffer_bytes: None,
+            connection_limit: None,
         }),
     );
     config.add_sink("out", &["in"], tcp_json_sink(out_addr.to_string()));
@@ -87,6 +91,7 @@ async fn test_unix_stream_syslog() {
         "in",
         SyslogConfig::from_mode(Mode::Unix {
             path: in_path.clone(),
+            socket_file_mode: None,
         }),
     );
     config.add_sink("out", &["in"], tcp_json_sink(out_addr.to_string()));
@@ -152,6 +157,7 @@ async fn test_octet_counting_syslog() {
             keepalive: None,
             tls: None,
             receive_buffer_bytes: None,
+            connection_limit: None,
         }),
     );
     config.add_sink("out", &["in"], tcp_json_sink(out_addr.to_string()));
@@ -159,6 +165,7 @@ async fn test_octet_counting_syslog() {
     let output_lines = CountReceiver::receive_lines(out_addr);
 
     let (topology, _crash) = start_topology(config.build().unwrap(), false).await;
+
     // Wait for server to accept traffic
     wait_for_tcp(in_addr).await;
 

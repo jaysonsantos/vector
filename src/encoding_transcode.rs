@@ -1,8 +1,9 @@
+use bytes::{Bytes, BytesMut};
+use encoding_rs::{CoderResult, Encoding};
+
 use crate::internal_events::{
     DecoderBomRemoval, DecoderMalformedReplacement, EncoderUnmappableReplacement,
 };
-use bytes::{Bytes, BytesMut};
-use encoding_rs::{CoderResult, Encoding};
 
 const BUFFER_SIZE: usize = 4096;
 
@@ -50,7 +51,7 @@ impl Decoder {
             let (result, read, written, had_errors) = self.inner.decode_to_utf8(
                 &input[total_read_from_input..],
                 &mut self.buffer,
-                false, // not last (since we are processing a continous stream)
+                false, // not last (since we are processing a continuous stream)
             );
 
             total_read_from_input += read;
@@ -158,7 +159,7 @@ impl Encoder {
             let (result, read, written, had_errors) = self.inner.encode_from_utf8(
                 &input[total_read_from_input..],
                 &mut self.buffer,
-                false, // not last (since we are processing a continous stream)
+                false, // not last (since we are processing a continuous stream)
             );
 
             total_read_from_input += read;
@@ -184,39 +185,45 @@ impl Encoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{Decoder, Encoder, BOM_UTF8};
+    use std::char::REPLACEMENT_CHARACTER;
+
     use bytes::Bytes;
     use encoding_rs::{SHIFT_JIS, UTF_16BE, UTF_16LE, UTF_8};
-    use std::char::REPLACEMENT_CHARACTER;
+
+    use super::{Decoder, Encoder, BOM_UTF8};
 
     // BOM unicode character (U+FEFF) expressed in utf-16
     // http://unicode.org/faq/utf_bom.html#bom4
     const BOM_UTF16LE: &[u8] = b"\xff\xfe";
 
     // test UTF_16LE data
-    fn test_data_utf16le_123() -> &'static [u8] {
-        b"1\02\03\0"
+    const fn test_data_utf16le_123() -> &'static [u8] {
+        b"1\x002\x003\x00"
     }
-    fn test_data_utf16le_crlf() -> &'static [u8] {
-        b"\r\0\n\0"
+
+    const fn test_data_utf16le_crlf() -> &'static [u8] {
+        b"\r\x00\n\x00"
     }
-    fn test_data_utf16le_vector_devanagari() -> &'static [u8] {
+
+    const fn test_data_utf16le_vector_devanagari() -> &'static [u8] {
         b"-\tG\t\x15\tM\t\x1f\t0\t"
     }
 
     // test UTF_16BE data
-    fn test_data_utf16be_123() -> &'static [u8] {
-        b"\01\02\03"
+    const fn test_data_utf16be_123() -> &'static [u8] {
+        b"\x001\x002\x003"
     }
-    fn test_data_utf16be_crlf() -> &'static [u8] {
-        b"\0\r\0\n"
+
+    const fn test_data_utf16be_crlf() -> &'static [u8] {
+        b"\x00\r\x00\n"
     }
-    fn test_data_utf16be_vector_devanagari() -> &'static [u8] {
+
+    const fn test_data_utf16be_vector_devanagari() -> &'static [u8] {
         b"\t-\tG\t\x15\tM\t\x1f\t0"
     }
 
     // test SHIFT_JIS data
-    fn test_data_shiftjis_helloworld_japanese() -> &'static [u8] {
+    const fn test_data_shiftjis_helloworld_japanese() -> &'static [u8] {
         b"\x83n\x83\x8D\x81[\x81E\x83\x8F\x81[\x83\x8B\x83h"
     }
 

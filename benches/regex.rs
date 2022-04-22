@@ -1,10 +1,8 @@
 use criterion::{criterion_group, BatchSize, Criterion, Throughput};
-
 use rand::{rngs::SmallRng, thread_rng, Rng, SeedableRng};
 use rand_distr::{Alphanumeric, Distribution, Uniform};
-
 use vector::{
-    config::{GlobalOptions, TransformConfig},
+    config::{TransformConfig, TransformContext},
     event::Event,
     test_util::runtime,
     transforms,
@@ -31,14 +29,14 @@ fn benchmark_regex(c: &mut Criterion) {
                 drop_failed: true,
                 ..Default::default()
             }
-            .build(&GlobalOptions::default())
+            .build(&TransformContext::default())
             .await
             .unwrap().into_function()
         });
 
         b.iter_batched(
             || {
-                (input.clone(), Vec::with_capacity(input.len()))
+                (input.clone(), transforms::OutputBuffer::with_capacity(input.len()))
             },
             |(events, mut output)| {
                 let event_count = events.len();
@@ -82,7 +80,7 @@ fn http_access_log_lines() -> impl Iterator<Item = String> {
 criterion_group!(
     name = benches;
     // encapsulates CI noise we saw in
-    // https://github.com/timberio/vector/issues/5394
+    // https://github.com/vectordotdev/vector/issues/5394
     config = Criterion::default().noise_threshold(0.07);
     targets = benchmark_regex
 );

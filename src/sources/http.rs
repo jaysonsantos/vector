@@ -1,25 +1,36 @@
+use std::{collections::HashMap, net::SocketAddr};
+
+use bytes::{Bytes, BytesMut};
+use chrono::Utc;
+use codecs::{
+    decoding::{DeserializerConfig, FramingConfig},
+    BytesDecoderConfig, BytesDeserializerConfig, JsonDeserializerConfig,
+    NewlineDelimitedDecoderConfig,
+};
+use http::StatusCode;
+use serde::{Deserialize, Serialize};
+use tokio_util::codec::Decoder as _;
+use warp::http::{HeaderMap, HeaderValue};
+
 use crate::{
+    codecs::{Decoder, DecodingConfig},
     config::{
-        log_schema, DataType, GenerateConfig, Resource, SourceConfig, SourceContext,
-        SourceDescription,
+        log_schema, AcknowledgementsConfig, DataType, GenerateConfig, Output, Resource,
+        SourceConfig, SourceContext, SourceDescription,
     },
     event::{Event, Value},
+    serde::{bool_or_struct, default_decoding, default_framing_stream_based},
     sources::util::{
-        add_query_parameters, decode_body, Encoding, ErrorMessage, HttpSource, HttpSourceAuthConfig,
+        add_query_parameters, Encoding, ErrorMessage, HttpSource, HttpSourceAuthConfig,
     },
     tls::TlsConfig,
 };
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, net::SocketAddr};
-
-use warp::http::{HeaderMap, HeaderValue};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct SimpleHttpConfig {
+pub(super) struct SimpleHttpConfig {
     address: SocketAddr,
     #[serde(default)]
-    encoding: Encoding,
+    encoding: Option<Encoding>,
     #[serde(default)]
     headers: Vec<String>,
     #[serde(default)]
@@ -32,6 +43,10 @@ pub struct SimpleHttpConfig {
     path: String,
     #[serde(default = "default_path_key")]
     path_key: String,
+    framing: Option<FramingConfig>,
+    decoding: Option<DeserializerConfig>,
+    #[serde(default, deserialize_with = "bool_or_struct")]
+    acknowledgements: AcknowledgementsConfig,
 }
 
 inventory::submit! {
@@ -42,7 +57,7 @@ impl GenerateConfig for SimpleHttpConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
             address: "0.0.0.0:8080".parse().unwrap(),
-            encoding: Default::default(),
+            encoding: None,
             headers: Vec::new(),
             query_parameters: Vec::new(),
             tls: None,
@@ -50,6 +65,9 @@ impl GenerateConfig for SimpleHttpConfig {
             path_key: "path".to_string(),
             path: "/".to_string(),
             strict_path: true,
+            framing: Some(default_framing_stream_based()),
+            decoding: Some(default_decoding()),
+            acknowledgements: AcknowledgementsConfig::default(),
         })
         .unwrap()
     }
@@ -65,10 +83,10 @@ fn default_path_key() -> String {
 
 #[derive(Clone)]
 struct SimpleHttpSource {
-    encoding: Encoding,
     headers: Vec<String>,
     query_parameters: Vec<String>,
     path_key: String,
+    decoder: Decoder,
 }
 
 impl HttpSource for SimpleHttpSource {
@@ -79,18 +97,39 @@ impl HttpSource for SimpleHttpSource {
         query_parameters: HashMap<String, String>,
         request_path: &str,
     ) -> Result<Vec<Event>, ErrorMessage> {
-        decode_body(body, self.encoding)
-            .map(|events| add_headers(events, &self.headers, header_map))
-            .map(|events| add_query_parameters(events, &self.query_parameters, query_parameters))
-            .map(|events| add_path(events, self.path_key.as_str(), request_path))
-            .map(|mut events| {
-                // Add source type
-                let key = log_schema().source_type_key();
-                for event in &mut events {
-                    event.as_mut_log().try_insert(key, Bytes::from("http"));
+        let mut decoder = self.decoder.clone();
+        let mut events = Vec::new();
+        let mut bytes = BytesMut::new();
+        bytes.extend_from_slice(&body);
+
+        loop {
+            match decoder.decode_eof(&mut bytes) {
+                Ok(Some((next, _))) => {
+                    events.extend(next.into_iter());
                 }
-                events
-            })
+                Ok(None) => break,
+                Err(error) => {
+                    return Err(ErrorMessage::new(
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed decoding body: {}", error),
+                    ))
+                }
+            }
+        }
+
+        add_headers(&mut events, &self.headers, header_map);
+        add_query_parameters(&mut events, &self.query_parameters, query_parameters);
+        add_path(&mut events, self.path_key.as_str(), request_path);
+
+        let now = Utc::now();
+        for event in &mut events {
+            let log = event.as_mut_log();
+
+            log.try_insert(log_schema().source_type_key(), Bytes::from("http"));
+            log.try_insert(log_schema().timestamp_key(), now);
+        }
+
+        Ok(events)
     }
 }
 
@@ -98,11 +137,48 @@ impl HttpSource for SimpleHttpSource {
 #[typetag::serde(name = "http")]
 impl SourceConfig for SimpleHttpConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
+        if self.encoding.is_some() && (self.framing.is_some() || self.decoding.is_some()) {
+            return Err("Using `encoding` is deprecated and does not have any effect when `decoding` or `framing` is provided. Configure `framing` and `decoding` instead.".into());
+        }
+
+        let (framing, decoding) = if let Some(encoding) = self.encoding {
+            match encoding {
+                Encoding::Text => (
+                    NewlineDelimitedDecoderConfig::new().into(),
+                    BytesDeserializerConfig::new().into(),
+                ),
+                Encoding::Json => (
+                    BytesDecoderConfig::new().into(),
+                    JsonDeserializerConfig::new().into(),
+                ),
+                Encoding::Ndjson => (
+                    NewlineDelimitedDecoderConfig::new().into(),
+                    JsonDeserializerConfig::new().into(),
+                ),
+                Encoding::Binary => (
+                    BytesDecoderConfig::new().into(),
+                    BytesDeserializerConfig::new().into(),
+                ),
+            }
+        } else {
+            (
+                match self.framing.as_ref() {
+                    Some(framing) => framing.clone(),
+                    None => default_framing_stream_based(),
+                },
+                match self.decoding.as_ref() {
+                    Some(decoding) => decoding.clone(),
+                    None => default_decoding(),
+                },
+            )
+        };
+
+        let decoder = DecodingConfig::new(framing, decoding).build();
         let source = SimpleHttpSource {
-            encoding: self.encoding,
             headers: self.headers.clone(),
             query_parameters: self.query_parameters.clone(),
             path_key: self.path_key.clone(),
+            decoder,
         };
         source.run(
             self.address,
@@ -111,11 +187,12 @@ impl SourceConfig for SimpleHttpConfig {
             &self.tls,
             &self.auth,
             cx,
+            self.acknowledgements,
         )
     }
 
-    fn output_type(&self) -> DataType {
-        DataType::Log
+    fn outputs(&self) -> Vec<Output> {
+        vec![Output::default(DataType::Log)]
     }
 
     fn source_type(&self) -> &'static str {
@@ -125,89 +202,93 @@ impl SourceConfig for SimpleHttpConfig {
     fn resources(&self) -> Vec<Resource> {
         vec![Resource::tcp(self.address)]
     }
+
+    fn can_acknowledge(&self) -> bool {
+        true
+    }
 }
 
-fn add_path(mut events: Vec<Event>, key: &str, path: &str) -> Vec<Event> {
+fn add_path(events: &mut [Event], key: &str, path: &str) {
     for event in events.iter_mut() {
         event
             .as_mut_log()
-            .insert(key, Value::from(path.to_string()));
+            .try_insert(key, Value::from(path.to_string()));
     }
-
-    events
 }
 
-fn add_headers(
-    mut events: Vec<Event>,
-    headers_config: &[String],
-    headers: HeaderMap,
-) -> Vec<Event> {
+fn add_headers(events: &mut [Event], headers_config: &[String], headers: HeaderMap) {
     for header_name in headers_config {
         let value = headers.get(header_name).map(HeaderValue::as_bytes);
 
         for event in events.iter_mut() {
-            event.as_mut_log().insert(
+            event.as_mut_log().try_insert_flat(
                 header_name as &str,
                 Value::from(value.map(Bytes::copy_from_slice)),
             );
         }
     }
-
-    events
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Encoding, SimpleHttpConfig};
-    use crate::{
-        config::{log_schema, SourceConfig, SourceContext},
-        event::{Event, EventStatus, Value},
-        test_util::{next_addr, spawn_collect_n, trace_init, wait_for_tcp},
-        Pipeline,
-    };
+    use std::{collections::BTreeMap, io::Write, net::SocketAddr};
+
     use flate2::{
-        write::{DeflateEncoder, GzEncoder},
+        write::{GzEncoder, ZlibEncoder},
         Compression,
     };
     use futures::Stream;
     use http::HeaderMap;
     use pretty_assertions::assert_eq;
-    use std::collections::BTreeMap;
-    use std::io::Write;
-    use std::net::SocketAddr;
+
+    use super::SimpleHttpConfig;
+    use crate::{
+        config::{log_schema, SourceConfig, SourceContext},
+        event::{Event, EventStatus, Value},
+        test_util::{components, next_addr, spawn_collect_n, trace_init, wait_for_tcp},
+        SourceSender,
+    };
+    use codecs::{
+        decoding::{DeserializerConfig, FramingConfig},
+        BytesDecoderConfig, JsonDeserializerConfig,
+    };
 
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<SimpleHttpConfig>();
     }
 
-    async fn source(
-        encoding: Encoding,
+    async fn source<'a>(
         headers: Vec<String>,
         query_parameters: Vec<String>,
-        path_key: &str,
-        path: &str,
+        path_key: &'a str,
+        path: &'a str,
         strict_path: bool,
         status: EventStatus,
         acknowledgements: bool,
-    ) -> (impl Stream<Item = Event>, SocketAddr) {
-        let (sender, recv) = Pipeline::new_test_finalize(status);
+        framing: Option<FramingConfig>,
+        decoding: Option<DeserializerConfig>,
+    ) -> (impl Stream<Item = Event> + 'a, SocketAddr) {
+        components::init_test();
+        let (sender, recv) = SourceSender::new_test_finalize(status);
         let address = next_addr();
         let path = path.to_owned();
         let path_key = path_key.to_owned();
-        let mut context = SourceContext::new_test(sender);
-        context.acknowledgements = acknowledgements;
+        let context = SourceContext::new_test(sender, None);
         tokio::spawn(async move {
             SimpleHttpConfig {
                 address,
-                encoding,
                 headers,
+                encoding: None,
                 query_parameters,
                 tls: None,
                 auth: None,
                 strict_path,
                 path_key,
                 path,
+                framing,
+                decoding,
+                acknowledgements: acknowledgements.into(),
             }
             .build(context)
             .await
@@ -281,17 +362,16 @@ mod tests {
         rx: impl Stream<Item = Event> + Unpin,
         n: usize,
     ) -> Vec<Event> {
-        spawn_collect_n(async move { assert_eq!(200, send.await) }, rx, n).await
+        let events = spawn_collect_n(async move { assert_eq!(200, send.await) }, rx, n).await;
+        components::SOURCE_TESTS.assert(&["http_path"]);
+        events
     }
 
     #[tokio::test]
     async fn http_multiline_text() {
-        trace_init();
-
-        let body = "test body\n\ntest body 2";
+        let body = "test body\ntest body 2";
 
         let (rx, addr) = source(
-            Encoding::default(),
             vec![],
             vec![],
             "http_path",
@@ -299,6 +379,8 @@ mod tests {
             true,
             EventStatus::Delivered,
             true,
+            None,
+            None,
         )
         .await;
 
@@ -324,13 +406,10 @@ mod tests {
 
     #[tokio::test]
     async fn http_multiline_text2() {
-        trace_init();
-
         //same as above test but with a newline at the end
-        let body = "test body\n\ntest body 2\n";
+        let body = "test body\ntest body 2\n";
 
         let (rx, addr) = source(
-            Encoding::default(),
             vec![],
             vec![],
             "http_path",
@@ -338,6 +417,8 @@ mod tests {
             true,
             EventStatus::Delivered,
             true,
+            None,
+            None,
         )
         .await;
 
@@ -362,14 +443,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_multiline_text3() {
+    async fn http_bytes_codec_preserves_newlines() {
         trace_init();
 
-        //same as above test but with a binary encoding
-        let body = "test body\n\ntest body 2\n";
+        let body = "foo\nbar";
 
         let (rx, addr) = source(
-            Encoding::Binary,
             vec![],
             vec![],
             "http_path",
@@ -377,18 +456,19 @@ mod tests {
             true,
             EventStatus::Delivered,
             true,
+            Some(BytesDecoderConfig::new().into()),
+            None,
         )
         .await;
 
         let mut events = spawn_ok_collect_n(send(addr, body), rx, 1).await;
 
+        assert_eq!(events.len(), 1);
+
         {
             let event = events.remove(0);
             let log = event.as_log();
-            assert_eq!(
-                log[log_schema().message_key()],
-                "test body\n\ntest body 2\n".into()
-            );
+            assert_eq!(log[log_schema().message_key()], "foo\nbar".into());
             assert!(log.get(log_schema().timestamp_key()).is_some());
             assert_eq!(log[log_schema().source_type_key()], "http".into());
             assert_eq!(log["http_path"], "/".into());
@@ -397,10 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_json_parsing() {
-        trace_init();
-
         let (rx, addr) = source(
-            Encoding::Json,
             vec![],
             vec![],
             "http_path",
@@ -408,6 +485,8 @@ mod tests {
             true,
             EventStatus::Delivered,
             true,
+            None,
+            Some(JsonDeserializerConfig::new().into()),
         )
         .await;
 
@@ -423,6 +502,7 @@ mod tests {
             2,
         )
         .await;
+        components::SOURCE_TESTS.assert(&["http_path"]);
 
         assert!(events
             .remove(1)
@@ -438,10 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_json_values() {
-        trace_init();
-
         let (rx, addr) = source(
-            Encoding::Json,
             vec![],
             vec![],
             "http_path",
@@ -449,6 +526,8 @@ mod tests {
             true,
             EventStatus::Delivered,
             true,
+            None,
+            Some(JsonDeserializerConfig::new().into()),
         )
         .await;
 
@@ -461,6 +540,7 @@ mod tests {
             2,
         )
         .await;
+        components::SOURCE_TESTS.assert(&["http_path"]);
 
         {
             let event = events.remove(0);
@@ -482,10 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_json_dotted_keys() {
-        trace_init();
-
         let (rx, addr) = source(
-            Encoding::Json,
             vec![],
             vec![],
             "http_path",
@@ -493,6 +570,8 @@ mod tests {
             true,
             EventStatus::Delivered,
             true,
+            None,
+            Some(JsonDeserializerConfig::new().into()),
         )
         .await;
 
@@ -508,6 +587,7 @@ mod tests {
             2,
         )
         .await;
+        components::SOURCE_TESTS.assert(&["http_path"]);
 
         {
             let event = events.remove(0);
@@ -525,10 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_ndjson() {
-        trace_init();
-
         let (rx, addr) = source(
-            Encoding::Ndjson,
             vec![],
             vec![],
             "http_path",
@@ -536,12 +613,17 @@ mod tests {
             true,
             EventStatus::Delivered,
             true,
+            None,
+            Some(JsonDeserializerConfig::new().into()),
         )
         .await;
 
         let mut events = spawn_collect_n(
             async move {
-                assert_eq!(400, send(addr, r#"[{"key":"value"}]"#).await); //one object per line
+                assert_eq!(
+                    200,
+                    send(addr, r#"[{"key1":"value1"},{"key2":"value2"}]"#).await
+                );
 
                 assert_eq!(
                     200,
@@ -549,10 +631,27 @@ mod tests {
                 );
             },
             rx,
-            2,
+            4,
         )
         .await;
+        components::SOURCE_TESTS.assert(&["http_path"]);
 
+        {
+            let event = events.remove(0);
+            let log = event.as_log();
+            assert_eq!(log["key1"], "value1".into());
+            assert!(log.get(log_schema().timestamp_key()).is_some());
+            assert_eq!(log[log_schema().source_type_key()], "http".into());
+            assert_eq!(log["http_path"], "/".into());
+        }
+        {
+            let event = events.remove(0);
+            let log = event.as_log();
+            assert_eq!(log["key2"], "value2".into());
+            assert!(log.get(log_schema().timestamp_key()).is_some());
+            assert_eq!(log[log_schema().source_type_key()], "http".into());
+            assert_eq!(log["http_path"], "/".into());
+        }
         {
             let event = events.remove(0);
             let log = event.as_log();
@@ -573,14 +672,11 @@ mod tests {
 
     #[tokio::test]
     async fn http_headers() {
-        trace_init();
-
         let mut headers = HeaderMap::new();
         headers.insert("User-Agent", "test_client".parse().unwrap());
         headers.insert("Upgrade-Insecure-Requests", "false".parse().unwrap());
 
         let (rx, addr) = source(
-            Encoding::Ndjson,
             vec![
                 "User-Agent".to_string(),
                 "Upgrade-Insecure-Requests".to_string(),
@@ -592,6 +688,8 @@ mod tests {
             true,
             EventStatus::Delivered,
             true,
+            None,
+            Some(JsonDeserializerConfig::new().into()),
         )
         .await;
 
@@ -606,8 +704,8 @@ mod tests {
             let event = events.remove(0);
             let log = event.as_log();
             assert_eq!(log["key1"], "value1".into());
-            assert_eq!(log["User-Agent"], "test_client".into());
-            assert_eq!(log["Upgrade-Insecure-Requests"], "false".into());
+            assert_eq!(log["\"User-Agent\""], "test_client".into());
+            assert_eq!(log["\"Upgrade-Insecure-Requests\""], "false".into());
             assert_eq!(log["AbsentHeader"], Value::Null);
             assert_eq!(log["http_path"], "/".into());
             assert!(log.get(log_schema().timestamp_key()).is_some());
@@ -617,9 +715,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_query() {
-        trace_init();
         let (rx, addr) = source(
-            Encoding::Ndjson,
             vec![],
             vec![
                 "source".to_string(),
@@ -631,6 +727,8 @@ mod tests {
             true,
             EventStatus::Delivered,
             true,
+            None,
+            Some(JsonDeserializerConfig::new().into()),
         )
         .await;
 
@@ -656,15 +754,13 @@ mod tests {
 
     #[tokio::test]
     async fn http_gzip_deflate() {
-        trace_init();
-
         let body = "test body";
 
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(body.as_bytes()).unwrap();
         let body = encoder.finish().unwrap();
 
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(body.as_slice()).unwrap();
         let body = encoder.finish().unwrap();
 
@@ -672,7 +768,6 @@ mod tests {
         headers.insert("Content-Encoding", "gzip, deflate".parse().unwrap());
 
         let (rx, addr) = source(
-            Encoding::default(),
             vec![],
             vec![],
             "http_path",
@@ -680,6 +775,8 @@ mod tests {
             true,
             EventStatus::Delivered,
             true,
+            None,
+            None,
         )
         .await;
 
@@ -697,9 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_path() {
-        trace_init();
         let (rx, addr) = source(
-            Encoding::Ndjson,
             vec![],
             vec![],
             "vector_http_path",
@@ -707,6 +802,8 @@ mod tests {
             true,
             EventStatus::Delivered,
             true,
+            None,
+            Some(JsonDeserializerConfig::new().into()),
         )
         .await;
 
@@ -729,9 +826,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_path_no_restriction() {
-        trace_init();
         let (rx, addr) = source(
-            Encoding::Ndjson,
             vec![],
             vec![],
             "vector_http_path",
@@ -739,6 +834,8 @@ mod tests {
             false,
             EventStatus::Delivered,
             true,
+            None,
+            Some(JsonDeserializerConfig::new().into()),
         )
         .await;
 
@@ -757,6 +854,7 @@ mod tests {
             2,
         )
         .await;
+        components::SOURCE_TESTS.assert(&["http_path"]);
 
         {
             let event = events.remove(0);
@@ -778,9 +876,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_wrong_path() {
-        trace_init();
         let (_rx, addr) = source(
-            Encoding::Ndjson,
             vec![],
             vec![],
             "vector_http_path",
@@ -788,6 +884,8 @@ mod tests {
             true,
             EventStatus::Delivered,
             true,
+            None,
+            Some(JsonDeserializerConfig::new().into()),
         )
         .await;
 
@@ -799,17 +897,16 @@ mod tests {
 
     #[tokio::test]
     async fn http_delivery_failure() {
-        trace_init();
-
         let (rx, addr) = source(
-            Encoding::default(),
             vec![],
             vec![],
             "http_path",
             "/",
             true,
-            EventStatus::Failed,
+            EventStatus::Rejected,
             true,
+            None,
+            None,
         )
         .await;
 
@@ -821,21 +918,21 @@ mod tests {
             1,
         )
         .await;
+        components::SOURCE_TESTS.assert(&["http_path"]);
     }
 
     #[tokio::test]
     async fn ignores_disabled_acknowledgements() {
-        trace_init();
-
         let (rx, addr) = source(
-            Encoding::default(),
             vec![],
             vec![],
             "http_path",
             "/",
             true,
-            EventStatus::Failed,
+            EventStatus::Rejected,
             false,
+            None,
+            None,
         )
         .await;
 
@@ -847,6 +944,7 @@ mod tests {
             1,
         )
         .await;
+        components::SOURCE_TESTS.assert(&["http_path"]);
 
         assert_eq!(events.len(), 1);
     }

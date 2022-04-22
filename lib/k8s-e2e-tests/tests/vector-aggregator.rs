@@ -1,27 +1,8 @@
-use indoc::indoc;
 use k8s_e2e_tests::*;
 use k8s_test_framework::{lock, vector::Config as VectorConfig};
 
-const HELM_CHART_VECTOR_AGGREGATOR: &str = "vector-aggregator";
-
-const HELM_VALUES_DUMMY_TOPOLOGY: &str = indoc! {r#"
-    sources:
-      dummy:
-        type: "generator"
-        format: "shuffle"
-        lines: ["Hello world"]
-        interval: 60 # once a minute
-
-    sinks:
-      stdout:
-        type: "console"
-        inputs: ["dummy"]
-        target: "stdout"
-        encoding: "json"
-"#};
-
-/// This test validates that vector-aggregator can deploy with the default
-/// settings and a dummy topology.
+/// This test validates that vector can deploy with the default
+/// aggregator settings.
 #[tokio::test]
 async fn dummy_topology() -> Result<(), Box<dyn std::error::Error>> {
     init();
@@ -32,14 +13,13 @@ async fn dummy_topology() -> Result<(), Box<dyn std::error::Error>> {
     let override_name = get_override_name(&namespace, "vector-aggregator");
 
     let vector = framework
-        .vector(
+        .helm_chart(
             &namespace,
-            HELM_CHART_VECTOR_AGGREGATOR,
+            "vector",
+            "vector",
+            "https://helm.vector.dev",
             VectorConfig {
-                custom_helm_values: vec![
-                    &config_override_name(&override_name, false),
-                    HELM_VALUES_DUMMY_TOPOLOGY,
-                ],
+                custom_helm_values: vec![&config_override_name(&override_name, false)],
                 ..Default::default()
             },
         )
@@ -68,9 +48,11 @@ async fn metrics_pipeline() -> Result<(), Box<dyn std::error::Error>> {
     let override_name = get_override_name(&namespace, "vector-aggregator");
 
     let vector = framework
-        .vector(
+        .helm_chart(
             &namespace,
-            HELM_CHART_VECTOR_AGGREGATOR,
+            "vector",
+            "vector",
+            "https://helm.vector.dev",
             VectorConfig {
                 custom_helm_values: vec![&config_override_name(&override_name, false)],
                 ..Default::default()

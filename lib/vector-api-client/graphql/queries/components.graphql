@@ -3,9 +3,15 @@ query ComponentsQuery($first: Int!) {
         edges {
             node {
                 __typename
-                name
+                componentId
                 componentType
                 ... on Source {
+                    outputs {
+                        outputId
+                        sentEventsTotal {
+                            sentEventsTotal
+                        }
+                    }
                     metrics {
                         __typename
                         processedEventsTotal {
@@ -14,15 +20,21 @@ query ComponentsQuery($first: Int!) {
                         processedBytesTotal {
                             processedBytesTotal
                         }
-                        eventsInTotal {
-                            eventsInTotal
+                        receivedEventsTotal {
+                            receivedEventsTotal
                         }
-                        eventsOutTotal {
-                            eventsOutTotal
+                        sentEventsTotal {
+                            sentEventsTotal
                         }
                     }
                 }
                 ... on Transform {
+                    outputs {
+                        outputId
+                        sentEventsTotal {
+                            sentEventsTotal
+                        }
+                    }
                     metrics {
                         __typename
                         processedEventsTotal {
@@ -31,11 +43,11 @@ query ComponentsQuery($first: Int!) {
                         processedBytesTotal {
                             processedBytesTotal
                         }
-                        eventsInTotal {
-                            eventsInTotal
+                        receivedEventsTotal {
+                            receivedEventsTotal
                         }
-                        eventsOutTotal {
-                            eventsOutTotal
+                        sentEventsTotal {
+                            sentEventsTotal
                         }
                     }
                 }
@@ -48,11 +60,11 @@ query ComponentsQuery($first: Int!) {
                         processedBytesTotal {
                             processedBytesTotal
                         }
-                        eventsInTotal {
-                            eventsInTotal
+                        receivedEventsTotal {
+                            receivedEventsTotal
                         }
-                        eventsOutTotal {
-                            eventsOutTotal
+                        sentEventsTotal {
+                            sentEventsTotal
                         }
                     }
                 }

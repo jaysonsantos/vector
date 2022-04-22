@@ -1,34 +1,49 @@
-use crate::{
-    config::{log_schema, DataType, Resource, SourceConfig, SourceContext, SourceDescription},
-    event::Event,
-    internal_events::{StdinEventReceived, StdinReadFailed},
-    shutdown::ShutdownSignal,
-    Pipeline,
-};
-use bytes::Bytes;
-use futures::{channel::mpsc, executor, FutureExt, SinkExt, StreamExt, TryStreamExt};
-use serde::{Deserialize, Serialize};
 use std::{io, thread};
+
+use async_stream::stream;
+use bytes::Bytes;
+use chrono::Utc;
+use codecs::{
+    decoding::{DeserializerConfig, FramingConfig},
+    StreamDecodingError,
+};
+use futures::{channel::mpsc, executor, SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use tokio_util::{codec::FramedRead, io::StreamReader};
+use vector_core::ByteSizeOf;
+
+use crate::{
+    codecs::DecodingConfig,
+    config::{
+        log_schema, DataType, Output, Resource, SourceConfig, SourceContext, SourceDescription,
+    },
+    internal_events::{BytesReceived, StdinEventsReceived, StreamClosedError},
+    serde::{default_decoding, default_framing_stream_based},
+    shutdown::ShutdownSignal,
+    SourceSender,
+};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields, default)]
 pub struct StdinConfig {
-    #[serde(default = "default_max_length")]
+    #[serde(default = "crate::serde::default_max_length")]
     pub max_length: usize,
     pub host_key: Option<String>,
+    #[serde(default = "default_framing_stream_based")]
+    pub framing: FramingConfig,
+    #[serde(default = "default_decoding")]
+    pub decoding: DeserializerConfig,
 }
 
 impl Default for StdinConfig {
     fn default() -> Self {
         StdinConfig {
-            max_length: default_max_length(),
-            host_key: None,
+            max_length: crate::serde::default_max_length(),
+            host_key: Default::default(),
+            framing: default_framing_stream_based(),
+            decoding: default_decoding(),
         }
     }
-}
-
-fn default_max_length() -> usize {
-    bytesize::kib(100u64) as usize
 }
 
 inventory::submit! {
@@ -49,8 +64,8 @@ impl SourceConfig for StdinConfig {
         )
     }
 
-    fn output_type(&self) -> DataType {
-        DataType::Log
+    fn outputs(&self) -> Vec<Output> {
+        vec![Output::default(DataType::Log)]
     }
 
     fn source_type(&self) -> &'static str {
@@ -60,13 +75,17 @@ impl SourceConfig for StdinConfig {
     fn resources(&self) -> Vec<Resource> {
         vec![Resource::Stdin]
     }
+
+    fn can_acknowledge(&self) -> bool {
+        false
+    }
 }
 
 pub fn stdin_source<R>(
-    stdin: R,
+    mut stdin: R,
     config: StdinConfig,
     shutdown: ShutdownSignal,
-    out: Pipeline,
+    mut out: SourceSender,
 ) -> crate::Result<super::Source>
 where
     R: Send + io::BufRead + 'static,
@@ -75,89 +94,109 @@ where
         .host_key
         .unwrap_or_else(|| log_schema().host_key().to_string());
     let hostname = crate::get_hostname().ok();
+    let decoder = DecodingConfig::new(config.framing.clone(), config.decoding).build();
 
     let (mut sender, receiver) = mpsc::channel(1024);
 
-    // Start the background thread
+    // Spawn background thread with blocking I/O to process stdin.
+    //
+    // This is recommended by Tokio, as otherwise the process will not shut down
+    // until another newline is entered. See
+    // https://github.com/tokio-rs/tokio/blob/a73428252b08bf1436f12e76287acbc4600ca0e5/tokio/src/io/stdin.rs#L33-L42
     thread::spawn(move || {
         info!("Capturing STDIN.");
 
-        for line in stdin.lines() {
-            if executor::block_on(sender.send(line)).is_err() {
-                // receiver has closed so we should shutdown
-                return;
+        loop {
+            let (buffer, len) = match stdin.fill_buf() {
+                Ok(buffer) if buffer.is_empty() => break, // EOF.
+                Ok(buffer) => (Ok(Bytes::copy_from_slice(buffer)), buffer.len()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => (Err(error), 0),
+            };
+
+            stdin.consume(len);
+
+            emit!(BytesReceived {
+                byte_size: len,
+                protocol: "none"
+            });
+            if executor::block_on(sender.send(buffer)).is_err() {
+                // Receiver has closed so we should shutdown.
+                break;
             }
         }
     });
 
     Ok(Box::pin(async move {
-        let mut out =
-            out.sink_map_err(|error| error!(message = "Unable to send event to out.", %error));
+        let stream = StreamReader::new(receiver);
+        let mut stream = FramedRead::new(stream, decoder).take_until(shutdown);
+        let mut stream = stream! {
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok((events, _byte_size)) => {
+                        emit!(StdinEventsReceived {
+                            byte_size: events.size_of(),
+                            count: events.len()
+                        });
 
-        let res = receiver
-            .take_until(shutdown)
-            .map_err(|error| emit!(StdinReadFailed { error }))
-            .map_ok(move |line| {
-                emit!(StdinEventReceived {
-                    byte_size: line.len()
-                });
-                create_event(Bytes::from(line), &host_key, &hostname)
-            })
-            .forward(&mut out)
-            .inspect(|_| info!("Finished sending."))
-            .await;
+                        let now = Utc::now();
 
-        let _ = out.flush().await; // error emitted by sink_map_err
+                        for mut event in events {
+                            let log = event.as_mut_log();
 
-        res
+                            log.try_insert(log_schema().source_type_key(), Bytes::from("stdin"));
+                            log.try_insert(log_schema().timestamp_key(), now);
+
+                            if let Some(hostname) = &hostname {
+                                log.try_insert(host_key.as_str(), hostname.clone());
+                            }
+
+                            yield event;
+                        }
+                    }
+                    Err(error) => {
+                        // Error is logged by `crate::codecs::Decoder`, no
+                        // further handling is needed here.
+                        if !error.can_continue() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        .boxed();
+
+        match out.send_event_stream(&mut stream).await {
+            Ok(()) => {
+                info!("Finished sending.");
+                Ok(())
+            }
+            Err(error) => {
+                let (count, _) = stream.size_hint();
+                emit!(StreamClosedError { error, count });
+                Err(())
+            }
+        }
     }))
-}
-
-fn create_event(line: Bytes, host_key: &str, hostname: &Option<String>) -> Event {
-    let mut event = Event::from(line);
-
-    // Add source type
-    event
-        .as_mut_log()
-        .insert(log_schema().source_type_key(), Bytes::from("stdin"));
-
-    if let Some(hostname) = &hostname {
-        event.as_mut_log().insert(host_key, hostname.clone());
-    }
-
-    event
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{test_util::trace_init, Pipeline};
     use std::io::Cursor;
+
+    use super::*;
+    use crate::{test_util::trace_init, SourceSender};
 
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<StdinConfig>();
     }
 
-    #[test]
-    fn stdin_create_event() {
-        let line = Bytes::from("hello world");
-        let host_key = "host".to_string();
-        let hostname = Some("Some.Machine".to_string());
-
-        let event = create_event(line, &host_key, &hostname);
-        let log = event.into_log();
-
-        assert_eq!(log["host"], "Some.Machine".into());
-        assert_eq!(log[log_schema().message_key()], "hello world".into());
-        assert_eq!(log[log_schema().source_type_key()], "stdin".into());
-    }
-
     #[tokio::test]
     async fn stdin_decodes_line() {
         trace_init();
 
-        let (tx, rx) = Pipeline::new_test();
+        let (tx, rx) = SourceSender::new_test();
         let config = StdinConfig::default();
         let buf = Cursor::new("hello world\nhello world again");
 

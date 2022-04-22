@@ -1,46 +1,84 @@
-use crate::udp;
+use std::net::SocketAddr;
+
+use bytes::{Bytes, BytesMut};
+use chrono::Utc;
+use codecs::{
+    decoding::{DeserializerConfig, FramingConfig},
+    StreamDecodingError,
+};
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use tokio::net::UdpSocket;
+use tokio_util::codec::FramedRead;
+use vector_core::ByteSizeOf;
+
 use crate::{
+    codecs::Decoder,
+    config::log_schema,
     event::Event,
-    internal_events::{SocketEventReceived, SocketMode, SocketReceiveError},
+    internal_events::{
+        BytesReceived, SocketEventsReceived, SocketMode, SocketReceiveError, StreamClosedError,
+    },
+    serde::{default_decoding, default_framing_message_based},
     shutdown::ShutdownSignal,
     sources::Source,
-    Pipeline,
+    udp, SourceSender,
 };
-use bytes::{Bytes, BytesMut};
-use codec::BytesDelimitedCodec;
-use futures::SinkExt;
-use getset::{CopyGetters, Getters};
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-use tokio::net::UdpSocket;
-use tokio_util::codec::Decoder;
 
 /// UDP processes messages per packet, where messages are separated by newline.
-#[derive(Deserialize, Serialize, Debug, Clone, Getters, CopyGetters)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct UdpConfig {
-    #[get_copy = "pub"]
     address: SocketAddr,
-    #[serde(default = "default_max_length")]
-    #[get_copy = "pub"]
+    #[serde(default = "crate::serde::default_max_length")]
     max_length: usize,
-    #[get = "pub"]
     host_key: Option<String>,
-    #[get_copy = "pub"]
+    port_key: Option<String>,
     receive_buffer_bytes: Option<usize>,
-}
-
-fn default_max_length() -> usize {
-    bytesize::kib(100u64) as usize
+    #[serde(default = "default_framing_message_based")]
+    framing: FramingConfig,
+    #[serde(default = "default_decoding")]
+    decoding: DeserializerConfig,
 }
 
 impl UdpConfig {
+    pub const fn host_key(&self) -> &Option<String> {
+        &self.host_key
+    }
+
+    pub const fn port_key(&self) -> &Option<String> {
+        &self.port_key
+    }
+
+    pub const fn framing(&self) -> &FramingConfig {
+        &self.framing
+    }
+
+    pub const fn decoding(&self) -> &DeserializerConfig {
+        &self.decoding
+    }
+
+    pub const fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub const fn max_length(&self) -> usize {
+        self.max_length
+    }
+
+    pub const fn receive_buffer_bytes(&self) -> Option<usize> {
+        self.receive_buffer_bytes
+    }
+
     pub fn from_address(address: SocketAddr) -> Self {
         Self {
             address,
-            max_length: default_max_length(),
+            max_length: crate::serde::default_max_length(),
             host_key: None,
+            port_key: Some(String::from("port")),
             receive_buffer_bytes: None,
+            framing: default_framing_message_based(),
+            decoding: default_decoding(),
         }
     }
 }
@@ -49,12 +87,12 @@ pub fn udp(
     address: SocketAddr,
     max_length: usize,
     host_key: String,
+    port_key: Option<String>,
     receive_buffer_bytes: Option<usize>,
+    decoder: Decoder,
     mut shutdown: ShutdownSignal,
-    out: Pipeline,
+    mut out: SourceSender,
 ) -> Source {
-    let mut out = out.sink_map_err(|error| error!(message = "Error sending event.", %error));
-
     Box::pin(async move {
         let socket = UdpSocket::bind(&address)
             .await
@@ -80,35 +118,60 @@ pub fn udp(
             tokio::select! {
                 recv = socket.recv_from(&mut buf) => {
                     let (byte_size, address) = recv.map_err(|error| {
+                        let error = codecs::decoding::Error::FramingError(error.into());
                         emit!(SocketReceiveError {
-                            error,
-                            mode: SocketMode::Udp
-                        });
+                            mode: SocketMode::Udp,
+                            error: &error
+                        })
                     })?;
 
-                    let mut payload = buf.split_to(byte_size);
+                    emit!(BytesReceived { byte_size, protocol: "udp" });
 
-                    // UDP processes messages per payload, where messages are separated by newline
-                    // and stretch to end of payload.
-                    let mut decoder = BytesDelimitedCodec::new(b'\n');
-                    while let Ok(Some(line)) = decoder.decode_eof(&mut payload) {
-                        let mut event = Event::from(line);
+                    let payload = buf.split_to(byte_size);
 
-                        event
-                            .as_mut_log()
-                            .insert(crate::config::log_schema().source_type_key(), Bytes::from("socket"));
-                        event
-                            .as_mut_log()
-                            .insert(host_key.clone(), address.to_string());
+                    let mut stream = FramedRead::new(payload.as_ref(), decoder.clone());
 
-                        emit!(SocketEventReceived { byte_size,mode:SocketMode::Udp });
+                    while let Some(result) = stream.next().await {
+                        match result {
+                            Ok((mut events, _byte_size)) => {
+                                let count = events.len();
+                                emit!(SocketEventsReceived {
+                                    mode: SocketMode::Udp,
+                                    byte_size: events.size_of(),
+                                    count,
+                                });
 
-                        tokio::select!{
-                            result = out.send(event) => {match result {
-                                Ok(()) => { },
-                                Err(()) => return Ok(()),
-                            }}
-                            _ = &mut shutdown => return Ok(()),
+                                let now = Utc::now();
+
+                                for event in &mut events {
+                                    if let Event::Log(ref mut log) = event {
+                                        log.try_insert(log_schema().source_type_key(), Bytes::from("socket"));
+                                        log.try_insert(log_schema().timestamp_key(), now);
+                                        log.try_insert(host_key.as_str(), address.ip().to_string());
+
+                                        if let Some(port_key) = &port_key {
+                                            log.try_insert(port_key.as_str(), address.port());
+                                        }
+                                    }
+                                }
+
+                                tokio::select!{
+                                    result = out.send_batch(events) => {
+                                        if let Err(error) = result {
+                                            emit!(StreamClosedError { error, count });
+                                            return Ok(())
+                                        }
+                                    }
+                                    _ = &mut shutdown => return Ok(()),
+                                }
+                            }
+                            Err(error) => {
+                                // Error is logged by `crate::codecs::Decoder`, no
+                                // further handling is needed here.
+                                if !error.can_continue() {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

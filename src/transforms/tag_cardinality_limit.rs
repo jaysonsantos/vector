@@ -1,22 +1,27 @@
-use crate::transforms::TaskTransform;
-use crate::{
-    config::{DataType, GenerateConfig, GlobalOptions, TransformConfig, TransformDescription},
-    event::Event,
-    internal_events::{
-        TagCardinalityLimitRejectingEvent, TagCardinalityLimitRejectingTag,
-        TagCardinalityValueLimitReached,
-    },
-    transforms::Transform,
-};
-use bloom::{BloomFilter, ASMS};
-use futures::{Stream, StreamExt};
-use serde::{Deserialize, Serialize};
 use std::{
     borrow::{Borrow, Cow},
     collections::{HashMap, HashSet},
     fmt,
     future::ready,
     pin::Pin,
+};
+
+use bloom::{BloomFilter, ASMS};
+use futures::{Stream, StreamExt};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    config::{
+        DataType, GenerateConfig, Input, Output, TransformConfig, TransformContext,
+        TransformDescription,
+    },
+    event::Event,
+    internal_events::{
+        TagCardinalityLimitRejectingEvent, TagCardinalityLimitRejectingTag,
+        TagCardinalityValueLimitReached,
+    },
+    schema,
+    transforms::{TaskTransform, Transform},
 };
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -59,15 +64,15 @@ pub struct TagCardinalityLimit {
     accepted_tags: HashMap<String, TagValueSet>,
 }
 
-fn default_limit_exceeded_action() -> LimitExceededAction {
+const fn default_limit_exceeded_action() -> LimitExceededAction {
     LimitExceededAction::DropTag
 }
 
-fn default_value_limit() -> u32 {
+const fn default_value_limit() -> u32 {
     500
 }
 
-fn default_cache_size() -> usize {
+const fn default_cache_size() -> usize {
     5000 * 1024 // 5KB
 }
 
@@ -89,16 +94,18 @@ impl GenerateConfig for TagCardinalityLimitConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "tag_cardinality_limit")]
 impl TransformConfig for TagCardinalityLimitConfig {
-    async fn build(&self, _globals: &GlobalOptions) -> crate::Result<Transform> {
-        Ok(Transform::task(TagCardinalityLimit::new(self.clone())))
+    async fn build(&self, _context: &TransformContext) -> crate::Result<Transform> {
+        Ok(Transform::event_task(TagCardinalityLimit::new(
+            self.clone(),
+        )))
     }
 
-    fn input_type(&self) -> DataType {
-        DataType::Metric
+    fn input(&self) -> Input {
+        Input::metric()
     }
 
-    fn output_type(&self) -> DataType {
-        DataType::Metric
+    fn outputs(&self, _: &schema::Definition) -> Vec<Output> {
+        vec![Output::default(DataType::Metric)]
     }
 
     fn transform_type(&self) -> &'static str {
@@ -155,7 +162,7 @@ impl TagValueSet {
         }
     }
 
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.num_elements
     }
 
@@ -172,20 +179,21 @@ impl TagValueSet {
 }
 
 impl TagCardinalityLimit {
-    fn new(config: TagCardinalityLimitConfig) -> TagCardinalityLimit {
-        TagCardinalityLimit {
+    fn new(config: TagCardinalityLimitConfig) -> Self {
+        Self {
             config,
             accepted_tags: HashMap::new(),
         }
     }
 
-    /// Takes in key and a value corresponding to a tag on an incoming Metric Event.
-    /// If that value is already part of set of accepted values for that key, then simply returns
-    /// true.  If that value is not yet part of the accepted values for that key, checks whether
-    /// we have hit the value_limit for that key yet and if not adds the value to the set of
-    /// accepted values for the key and returns true, otherwise returns false.  A false return
-    /// value indicates to the caller that the value is not accepted for this key, and the
-    /// configured limit_exceeded_action should be taken.
+    /// Takes in key and a value corresponding to a tag on an incoming Metric
+    /// Event.  If that value is already part of set of accepted values for that
+    /// key, then simply returns true.  If that value is not yet part of the
+    /// accepted values for that key, checks whether we have hit the value_limit
+    /// for that key yet and if not adds the value to the set of accepted values
+    /// for the key and returns true, otherwise returns false.  A false return
+    /// value indicates to the caller that the value is not accepted for this
+    /// key, and the configured limit_exceeded_action should be taken.
     fn try_accept_tag(&mut self, key: &str, value: Cow<'_, String>) -> bool {
         if !self.accepted_tags.contains_key(key) {
             self.accepted_tags.insert(
@@ -252,7 +260,7 @@ impl TagCardinalityLimit {
     }
 }
 
-impl TaskTransform for TagCardinalityLimit {
+impl TaskTransform<Event> for TagCardinalityLimit {
     fn transform(
         self: Box<Self>,
         task: Pin<Box<dyn Stream<Item = Event> + Send>>,
@@ -267,10 +275,13 @@ impl TaskTransform for TagCardinalityLimit {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::transforms::tag_cardinality_limit::{default_cache_size, BloomFilterConfig, Mode};
-    use crate::{event::metric, event::Event, event::Metric};
     use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::{
+        event::{metric, Event, Metric},
+        transforms::tag_cardinality_limit::{default_cache_size, BloomFilterConfig, Mode},
+    };
 
     #[test]
     fn generate_config() {

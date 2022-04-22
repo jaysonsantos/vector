@@ -1,5 +1,12 @@
 use vrl::prelude::*;
 
+fn object(value: Value) -> Resolved {
+    match value {
+        v @ Value::Object(_) => Ok(v),
+        v => Err(format!("expected object, got {}", v.kind()).into()),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Object;
 
@@ -27,16 +34,26 @@ impl Function for Object {
                 title: "invalid",
                 source: "object!(true)",
                 result: Err(
-                    r#"function call error for "object" at (0:13): expected "object", got "boolean""#,
+                    r#"function call error for "object" at (0:13): expected object, got boolean"#,
                 ),
             },
         ]
     }
 
-    fn compile(&self, mut arguments: ArgumentList) -> Compiled {
+    fn compile(
+        &self,
+        _state: (&mut state::LocalEnv, &mut state::ExternalEnv),
+        _ctx: &mut FunctionCompileContext,
+        mut arguments: ArgumentList,
+    ) -> Compiled {
         let value = arguments.required("value");
 
         Ok(Box::new(ObjectFn { value }))
+    }
+
+    fn call_by_vm(&self, _ctx: &mut Context, args: &mut VmArgumentList) -> Resolved {
+        let value = args.required("value");
+        object(value)
     }
 }
 
@@ -47,16 +64,13 @@ struct ObjectFn {
 
 impl Expression for ObjectFn {
     fn resolve(&self, ctx: &mut Context) -> Resolved {
-        match self.value.resolve(ctx)? {
-            v @ Value::Object(_) => Ok(v),
-            v => Err(format!(r#"expected "object", got {}"#, v.kind()).into()),
-        }
+        object(self.value.resolve(ctx)?)
     }
 
-    fn type_def(&self, state: &state::Compiler) -> TypeDef {
+    fn type_def(&self, state: (&state::LocalEnv, &state::ExternalEnv)) -> TypeDef {
         self.value
             .type_def(state)
-            .fallible_unless(Kind::Object)
+            .fallible_unless(Kind::object(Collection::any()))
             .restrict_object()
     }
 }

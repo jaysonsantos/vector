@@ -1,7 +1,13 @@
+#![deny(clippy::all)]
+#![deny(unreachable_pub)]
+#![deny(unused_allocation)]
+#![deny(unused_extern_crates)]
+#![deny(unused_assignments)]
+#![deny(unused_comparisons)]
+
 mod compiler;
 mod context;
 mod program;
-mod target;
 mod test_util;
 
 pub mod expression;
@@ -9,26 +15,75 @@ pub mod function;
 pub mod state;
 pub mod type_def;
 pub mod value;
+pub mod vm;
 
-pub(crate) use diagnostic::Span;
-pub(crate) use state::Compiler as State;
-
+pub use crate::value::Value;
+use ::serde::{Deserialize, Serialize};
 pub use context::Context;
-pub use expression::{Expression, ExpressionError, Resolved};
+pub use core::{value, ExpressionError, Resolved, Target};
+pub(crate) use diagnostic::Span;
+pub use expression::Expression;
 pub use function::{Function, Parameter};
-pub use program::Program;
-pub use target::Target;
-pub use type_def::TypeDef;
-pub use value::Value;
-
 pub use paste::paste;
+pub use program::Program;
+use state::ExternalEnv;
+use std::{fmt::Display, str::FromStr};
+pub use type_def::TypeDef;
 
-pub type Result = std::result::Result<Program, compiler::Errors>;
+pub type Result<T = Program> = std::result::Result<T, compiler::Errors>;
+
+/// The choice of available runtimes.
+#[derive(Deserialize, Serialize, Debug, Copy, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum VrlRuntime {
+    Ast,
+    Vm,
+}
+
+impl Default for VrlRuntime {
+    fn default() -> Self {
+        Self::Ast
+    }
+}
+
+impl FromStr for VrlRuntime {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "ast" => Ok(Self::Ast),
+            "vm" => Ok(Self::Vm),
+            _ => Err("runtime must be ast or vm."),
+        }
+    }
+}
+
+impl Display for VrlRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                VrlRuntime::Ast => "ast",
+                VrlRuntime::Vm => "vm",
+            }
+        )
+    }
+}
 
 /// Compile a given program [`ast`](parser::Program) into the final [`Program`].
 pub fn compile(ast: parser::Program, fns: &[Box<dyn Function>]) -> Result {
-    let mut state = State::default();
-    compile_with_state(ast, fns, &mut state)
+    let mut external = ExternalEnv::default();
+    compile_with_state(ast, fns, &mut external)
+}
+
+pub fn compile_for_repl(
+    ast: parser::Program,
+    fns: &[Box<dyn Function>],
+    local: state::LocalEnv,
+    external: &mut ExternalEnv,
+) -> Result<(Program, state::LocalEnv)> {
+    compiler::Compiler::new_with_local_state(fns, local).compile(ast, external)
 }
 
 /// Similar to [`compile`], except that it takes a pre-generated [`State`]
@@ -41,13 +96,17 @@ pub fn compile(ast: parser::Program, fns: &[Box<dyn Function>]) -> Result {
 pub fn compile_with_state(
     ast: parser::Program,
     fns: &[Box<dyn Function>],
-    state: &mut State,
+    state: &mut ExternalEnv,
 ) -> Result {
-    compiler::Compiler::new(fns, state).compile(ast)
+    compiler::Compiler::new(fns)
+        .compile(ast, state)
+        .map(|(program, _)| program)
 }
 
 /// re-export of commonly used parser types.
 pub(crate) mod parser {
-    pub use ::parser::ast::{self, Ident, Node};
-    pub use ::parser::Program;
+    pub(crate) use ::parser::{
+        ast::{self, Ident, Node},
+        Program,
+    };
 }

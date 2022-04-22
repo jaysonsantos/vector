@@ -1,5 +1,6 @@
-use bytes::BytesMut;
 use std::io;
+
+use bytes::BytesMut;
 use tokio_util::codec::Decoder;
 
 #[derive(Debug)]
@@ -8,7 +9,7 @@ pub struct SizedBytesCodec {
 }
 
 impl SizedBytesCodec {
-    pub fn new_with_max_length(max_length: usize) -> Self {
+    pub const fn new_with_max_length(max_length: usize) -> Self {
         SizedBytesCodec { max_length }
     }
 }

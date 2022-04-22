@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_while1},
@@ -6,8 +8,12 @@ use nom::{
     sequence::{delimited, preceded},
     IResult,
 };
-use std::collections::BTreeMap;
 use vrl::prelude::*;
+
+fn parse_aws_alb_log(bytes: Value) -> Resolved {
+    let bytes = bytes.try_bytes()?;
+    parse_log(&String::from_utf8_lossy(&bytes))
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ParseAwsAlbLog;
@@ -27,7 +33,12 @@ impl Function for ParseAwsAlbLog {
         }]
     }
 
-    fn compile(&self, mut arguments: ArgumentList) -> Compiled {
+    fn compile(
+        &self,
+        _state: (&mut state::LocalEnv, &mut state::ExternalEnv),
+        _ctx: &mut FunctionCompileContext,
+        mut arguments: ArgumentList,
+    ) -> Compiled {
         let value = arguments.required("value");
 
         Ok(Box::new(ParseAwsAlbLogFn::new(value)))
@@ -39,6 +50,11 @@ impl Function for ParseAwsAlbLog {
             kind: kind::BYTES,
             required: true,
         }]
+    }
+
+    fn call_by_vm(&self, _ctx: &mut Context, args: &mut VmArgumentList) -> Resolved {
+        let value = args.required("value");
+        parse_aws_alb_log(value)
     }
 }
 
@@ -55,52 +71,52 @@ impl ParseAwsAlbLogFn {
 
 impl Expression for ParseAwsAlbLogFn {
     fn resolve(&self, ctx: &mut Context) -> Resolved {
-        let bytes = self.value.resolve(ctx)?.try_bytes()?;
-
-        parse_log(&String::from_utf8_lossy(&bytes))
+        let bytes = self.value.resolve(ctx)?;
+        parse_aws_alb_log(bytes)
     }
 
-    fn type_def(&self, _: &state::Compiler) -> TypeDef {
-        TypeDef::new()
-            .fallible() // Log parsing error
-            .object::<&str, Kind>(inner_type_def())
+    fn type_def(&self, _: (&state::LocalEnv, &state::ExternalEnv)) -> TypeDef {
+        TypeDef::object(inner_kind()).fallible(/* log parsing error */)
     }
 }
 
-fn inner_type_def() -> BTreeMap<&'static str, Kind> {
+fn inner_kind() -> BTreeMap<Field, Kind> {
     map! {
-        "actions_executed": Kind::Bytes | Kind::Null,
-        "chosen_cert_arn": Kind::Bytes | Kind::Null,
-        "classification_reason": Kind::Bytes | Kind::Null,
-        "classification": Kind::Bytes | Kind::Null,
-        "client_host": Kind::Bytes,
-        "domain_name": Kind::Bytes | Kind::Null,
-        "elb_status_code": Kind::Bytes,
-        "elb": Kind::Bytes,
-        "error_reason": Kind::Bytes | Kind::Null,
-        "matched_rule_priority": Kind::Bytes | Kind::Null,
-        "received_bytes": Kind::Integer,
-        "redirect_url": Kind::Bytes | Kind::Null,
-        "request_creation_time": Kind::Bytes,
-        "request_method": Kind::Bytes,
-        "request_processing_time": Kind::Float,
-        "request_protocol": Kind::Bytes,
-        "request_url": Kind::Bytes,
-        "response_processing_time": Kind::Float,
-        "sent_bytes": Kind::Integer,
-        "ssl_cipher": Kind::Bytes | Kind::Null,
-        "ssl_protocol": Kind::Bytes | Kind::Null,
-        "target_group_arn": Kind::Bytes,
-        "target_host": Kind::Bytes | Kind::Null,
-        "target_port_list": Kind::Bytes | Kind::Null,
-        "target_processing_time": Kind::Float,
-        "target_status_code_list": Kind::Bytes | Kind::Null,
-        "target_status_code": Kind::Bytes | Kind::Null,
-        "timestamp": Kind::Bytes,
-        "trace_id": Kind::Bytes,
-        "type": Kind::Bytes,
-        "user_agent": Kind::Bytes,
+        "actions_executed": Kind::bytes() | Kind::null(),
+        "chosen_cert_arn": Kind::bytes() | Kind::null(),
+        "classification_reason": Kind::bytes() | Kind::null(),
+        "classification": Kind::bytes() | Kind::null(),
+        "client_host": Kind::bytes(),
+        "domain_name": Kind::bytes() | Kind::null(),
+        "elb_status_code": Kind::bytes(),
+        "elb": Kind::bytes(),
+        "error_reason": Kind::bytes() | Kind::null(),
+        "matched_rule_priority": Kind::bytes() | Kind::null(),
+        "received_bytes": Kind::integer(),
+        "redirect_url": Kind::bytes() | Kind::null(),
+        "request_creation_time": Kind::bytes(),
+        "request_method": Kind::bytes(),
+        "request_processing_time": Kind::float(),
+        "request_protocol": Kind::bytes(),
+        "request_url": Kind::bytes(),
+        "response_processing_time": Kind::float(),
+        "sent_bytes": Kind::integer(),
+        "ssl_cipher": Kind::bytes() | Kind::null(),
+        "ssl_protocol": Kind::bytes() | Kind::null(),
+        "target_group_arn": Kind::bytes(),
+        "target_host": Kind::bytes() | Kind::null(),
+        "target_port_list": Kind::bytes() | Kind::null(),
+        "target_processing_time": Kind::float(),
+        "target_status_code_list": Kind::bytes() | Kind::null(),
+        "target_status_code": Kind::bytes() | Kind::null(),
+        "timestamp": Kind::bytes(),
+        "trace_id": Kind::bytes(),
+        "type": Kind::bytes(),
+        "user_agent": Kind::bytes(),
     }
+    .into_iter()
+    .map(|(key, kind): (&str, _)| (key.into(), kind))
+    .collect()
 }
 
 fn parse_log(mut input: &str) -> Result<Value> {
@@ -132,12 +148,12 @@ fn parse_log(mut input: &str) -> Result<Value> {
         };
     }
     macro_rules! field {
-        ($name:expr, $($pattern:pat)|+) => {
+        ($name:expr, $($pattern:pat_param)|+) => {
             field_raw!($name, preceded(char(' '), take_while1(|c| matches!(c, $($pattern)|+))))
         };
     }
     macro_rules! field_parse {
-        ($name:expr, $($pattern:pat)|+, $type:ty) => {
+        ($name:expr, $($pattern:pat_param)|+, $type:ty) => {
             field_raw!($name, map_res(preceded(char(' '), take_while1(|c| matches!(c, $($pattern)|+))), |s: &str| s.parse::<$type>()))
         };
     }
@@ -145,11 +161,19 @@ fn parse_log(mut input: &str) -> Result<Value> {
     field_raw!("type", take_while1(|c| matches!(c, 'a'..='z' | '0'..='9')));
     field!("timestamp", '0'..='9' | '.' | '-' | ':' | 'T' | 'Z');
     field_raw!("elb", take_anything);
-    field!("client_host", '0'..='9' | '.' | ':' | '-');
-    field!("target_host", '0'..='9' | '.' | ':' | '-');
-    field_parse!("request_processing_time", '0'..='9' | '.' | '-', f64);
-    field_parse!("target_processing_time", '0'..='9' | '.' | '-', f64);
-    field_parse!("response_processing_time", '0'..='9' | '.' | '-', f64);
+    field!("client_host", '0'..='9' | 'a'..='f' | '.' | ':' | '-');
+    field!("target_host", '0'..='9' | 'a'..='f' | '.' | ':' | '-');
+    field_parse!(
+        "request_processing_time",
+        '0'..='9' | '.' | '-',
+        NotNan<f64>
+    );
+    field_parse!("target_processing_time", '0'..='9' | '.' | '-', NotNan<f64>);
+    field_parse!(
+        "response_processing_time",
+        '0'..='9' | '.' | '-',
+        NotNan<f64>
+    );
     field!("elb_status_code", '0'..='9' | '-');
     field!("target_status_code", '0'..='9' | '-');
     field_parse!("received_bytes", '0'..='9' | '-', i64);
@@ -197,7 +221,7 @@ fn parse_log(mut input: &str) -> Result<Value> {
     field_raw!("error_reason", take_quoted1);
     field_raw!(
         "target_port_list",
-        take_maybe_quoted_list(|c| matches!(c, '0'..='9' | '.' | ':' | '-'))
+        take_maybe_quoted_list(|c| matches!(c, '0'..='9' | 'a'..='f' | '.' | ':' | '-'))
     );
     field_raw!(
         "target_status_code_list",
@@ -297,7 +321,7 @@ mod tests {
                              user_agent: "curl/7.46.0"
 
             })),
-            tdef: TypeDef::new().fallible().object::<&str, Kind>(inner_type_def()),
+            tdef: TypeDef::object(inner_kind()).fallible(),
         }
 
         two {
@@ -333,7 +357,7 @@ mod tests {
                               trace_id: "Root=1-58337281-1d84f3d73c47ec4e58577259",
                               type: "https",
                               user_agent: "curl/7.46.0"})),
-            tdef: TypeDef::new().fallible().object::<&str, Kind>(inner_type_def()),
+            tdef: TypeDef::object(inner_kind()).fallible(),
         }
 
         three {
@@ -369,7 +393,7 @@ mod tests {
                               trace_id: "Root=1-58337327-72bd00b0343d75b906739c42",
                               type: "h2",
                               user_agent: "curl/7.46.0"})),
-            tdef: TypeDef::new().fallible().object::<&str, Kind>(inner_type_def()),
+            tdef: TypeDef::object(inner_kind()).fallible(),
         }
 
         four {
@@ -405,7 +429,7 @@ mod tests {
                              trace_id: "Root=1-58337364-23a8c76965a2ef7629b185e3",
                              type: "ws",
                              user_agent: null})),
-            tdef: TypeDef::new().fallible().object::<&str, Kind>(inner_type_def()),
+            tdef: TypeDef::object(inner_kind()).fallible(),
         }
 
         five {
@@ -441,7 +465,7 @@ mod tests {
                               trace_id: "Root=1-58337364-23a8c76965a2ef7629b185e3",
                               type: "wss",
                               user_agent: null})),
-            tdef: TypeDef::new().fallible().object::<&str, Kind>(inner_type_def()),
+            tdef: TypeDef::object(inner_kind()).fallible(),
         }
 
         six {
@@ -477,7 +501,7 @@ mod tests {
                               trace_id: "Root=1-58337364-23a8c76965a2ef7629b185e3",
                               type: "http",
                               user_agent: "curl/7.46.0"})),
-            tdef: TypeDef::new().fallible().object::<&str, Kind>(inner_type_def()),
+            tdef: TypeDef::object(inner_kind()).fallible(),
         }
 
         seven {
@@ -513,7 +537,7 @@ mod tests {
                              trace_id: "Root=1-58337364-23a8c76965a2ef7629b185e3",
                              type: "http",
                              user_agent: "curl/7.46.0"})),
-            tdef: TypeDef::new().fallible().object::<&str, Kind>(inner_type_def()),
+            tdef: TypeDef::object(inner_kind()).fallible(),
         }
 
         eight {
@@ -549,7 +573,7 @@ mod tests {
                              target_status_code_list: ["200"],
                              classification: null,
                              classification_reason: null})),
-            tdef: TypeDef::new().fallible().object::<&str, Kind>(inner_type_def()),
+            tdef: TypeDef::object(inner_kind()).fallible(),
         }
 
         nine {
@@ -585,7 +609,7 @@ mod tests {
                              target_status_code_list: [],
                              classification: null,
                              classification_reason: null})),
-            tdef: TypeDef::new().fallible().object::<&str, Kind>(inner_type_def()),
+            tdef: TypeDef::object(inner_kind()).fallible(),
         }
 
         ten {
@@ -621,7 +645,43 @@ mod tests {
                              target_status_code_list: [],
                              classification: null,
                              classification_reason: null})),
-            tdef: TypeDef::new().fallible().object::<&str, Kind>(inner_type_def()),
+            tdef: TypeDef::object(inner_kind()).fallible(),
+        }
+
+        eleven {
+            args: func_args![value: r#"https 2021-03-16T20:20:00.135052Z app/awseb-AWSEB-1MVD8OW91UMOH/a32a5528b8fdaa6b 2601:6bbc:c529:9dad:6bbc:c529:9dad:6bbc:50599 fd6d:6bbc:c529:6::face:ed83:f46:80 0.001 0.052 0.000 200 200 589 2084 "POST https://test.domain.com:443/api/deposits/transactions:search?detailsLevel=FULL&offset=0&limit=50 HTTP/1.1" "User 1.0" ECDHE-RSA-AES128-GCM-SHA256 TLSv1.2 arn:aws:elasticloadbalancing:us-east-1:755269215481:targetgroup/awseb-AWSEB-91MZX0WA1A0F/5a03cc723870f039 "Root=1-605112f0-31f367be4fd3da651daa4157" "some.domain.com" "arn:aws:acm:us-east-1:765229915481:certificate/d8450a8a-b4f6-4714-8535-17c625c36899" 0 2021-03-16T20:20:00.081000Z "waf,forward" "-" "-" "fd6d:6bbc:c529:27ff:b::dead:ed84:80" "200" "-" "-""#],
+            want: Ok(value!({type: "https",
+                             timestamp: "2021-03-16T20:20:00.135052Z",
+                             elb: "app/awseb-AWSEB-1MVD8OW91UMOH/a32a5528b8fdaa6b",
+                             client_host: "2601:6bbc:c529:9dad:6bbc:c529:9dad:6bbc:50599",
+                             target_host: "fd6d:6bbc:c529:6::face:ed83:f46:80",
+                             request_processing_time: 0.001,
+                             target_processing_time: 0.052,
+                             response_processing_time: 0.0,
+                             elb_status_code: "200",
+                             target_status_code: "200",
+                             received_bytes: 589,
+                             sent_bytes: 2084,
+                             request_method: "POST",
+                             request_url: "https://test.domain.com:443/api/deposits/transactions:search?detailsLevel=FULL&offset=0&limit=50",
+                             request_protocol: "HTTP/1.1",
+                             user_agent: "User 1.0",
+                             ssl_cipher: "ECDHE-RSA-AES128-GCM-SHA256",
+                             ssl_protocol: "TLSv1.2",
+                             target_group_arn: "arn:aws:elasticloadbalancing:us-east-1:755269215481:targetgroup/awseb-AWSEB-91MZX0WA1A0F/5a03cc723870f039",
+                             trace_id: "Root=1-605112f0-31f367be4fd3da651daa4157",
+                             domain_name: "some.domain.com",
+                             chosen_cert_arn: "arn:aws:acm:us-east-1:765229915481:certificate/d8450a8a-b4f6-4714-8535-17c625c36899",
+                             matched_rule_priority: "0",
+                             request_creation_time: "2021-03-16T20:20:00.081000Z",
+                             actions_executed: "waf,forward",
+                             redirect_url: null,
+                             error_reason: null,
+                             target_port_list: ["fd6d:6bbc:c529:27ff:b::dead:ed84:80"],
+                             target_status_code_list: ["200"],
+                             classification: null,
+                             classification_reason: null})),
+            tdef: TypeDef::object(inner_kind()).fallible(),
         }
     ];
 }

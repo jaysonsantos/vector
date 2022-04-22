@@ -1,3 +1,10 @@
+#![deny(clippy::all)]
+#![deny(unreachable_pub)]
+#![deny(unused_allocation)]
+#![deny(unused_extern_crates)]
+#![deny(unused_assignments)]
+#![deny(unused_comparisons)]
+
 mod util;
 
 #[cfg(feature = "append")]
@@ -20,6 +27,8 @@ mod contains;
 mod decode_base64;
 #[cfg(feature = "decode_percent")]
 mod decode_percent;
+#[cfg(feature = "decrypt")]
+mod decrypt;
 #[cfg(feature = "del")]
 mod del;
 #[cfg(feature = "downcase")]
@@ -34,10 +43,14 @@ mod encode_key_value;
 mod encode_logfmt;
 #[cfg(feature = "encode_percent")]
 mod encode_percent;
+#[cfg(feature = "encrypt")]
+mod encrypt;
 #[cfg(feature = "ends_with")]
 mod ends_with;
 #[cfg(feature = "exists")]
 mod exists;
+#[cfg(feature = "find")]
+mod find;
 #[cfg(feature = "flatten")]
 mod flatten;
 #[cfg(feature = "float")]
@@ -50,6 +63,8 @@ mod format_int;
 mod format_number;
 #[cfg(feature = "format_timestamp")]
 mod format_timestamp;
+#[cfg(feature = "get")]
+mod get;
 #[cfg(feature = "get_env_var")]
 mod get_env_var;
 #[cfg(feature = "get_hostname")]
@@ -64,6 +79,10 @@ mod ip_aton;
 mod ip_cidr_contains;
 #[cfg(feature = "ip_ntoa")]
 mod ip_ntoa;
+#[cfg(feature = "ip_ntop")]
+mod ip_ntop;
+#[cfg(feature = "ip_pton")]
+mod ip_pton;
 #[cfg(feature = "ip_subnet")]
 mod ip_subnet;
 #[cfg(feature = "ip_to_ipv6")]
@@ -74,6 +93,8 @@ mod ipv6_to_ipv4;
 mod is_array;
 #[cfg(feature = "is_boolean")]
 mod is_boolean;
+#[cfg(feature = "is_empty")]
+mod is_empty;
 #[cfg(feature = "is_float")]
 mod is_float;
 #[cfg(feature = "is_integer")]
@@ -138,6 +159,8 @@ mod parse_duration;
 mod parse_glog;
 #[cfg(feature = "parse_grok")]
 mod parse_grok;
+#[cfg(feature = "parse_groks")]
+mod parse_groks;
 #[cfg(feature = "parse_int")]
 mod parse_int;
 #[cfg(feature = "parse_json")]
@@ -168,16 +191,26 @@ mod parse_timestamp;
 mod parse_tokens;
 #[cfg(feature = "parse_url")]
 mod parse_url;
+#[cfg(feature = "parse_user_agent")]
+mod parse_user_agent;
 #[cfg(feature = "parse_xml")]
 mod parse_xml;
 #[cfg(feature = "push")]
 mod push;
+#[cfg(feature = "random_bytes")]
+mod random_bytes;
 #[cfg(feature = "redact")]
 mod redact;
+#[cfg(feature = "remove")]
+mod remove;
 #[cfg(feature = "replace")]
 mod replace;
+#[cfg(feature = "reverse_dns")]
+mod reverse_dns;
 #[cfg(feature = "round")]
 mod round;
+#[cfg(feature = "set")]
+mod set;
 #[cfg(feature = "sha1")]
 mod sha1;
 #[cfg(feature = "sha2")]
@@ -196,8 +229,14 @@ mod string;
 mod strip_ansi_escape_codes;
 #[cfg(feature = "strip_whitespace")]
 mod strip_whitespace;
+#[cfg(feature = "strlen")]
+mod strlen;
 #[cfg(feature = "tag_types_externally")]
 mod tag_types_externally;
+#[cfg(feature = "tally")]
+mod tally;
+#[cfg(feature = "tally_value")]
+mod tally_value;
 #[cfg(feature = "timestamp")]
 mod timestamp;
 #[cfg(feature = "to_bool")]
@@ -222,6 +261,8 @@ mod to_timestamp;
 mod to_unix_timestamp;
 #[cfg(feature = "truncate")]
 mod truncate;
+#[cfg(feature = "unique")]
+mod unique;
 #[cfg(feature = "unnest")]
 mod unnest;
 #[cfg(feature = "upcase")]
@@ -255,6 +296,8 @@ pub use contains::Contains;
 pub use decode_base64::DecodeBase64;
 #[cfg(feature = "decode_percent")]
 pub use decode_percent::DecodePercent;
+#[cfg(feature = "decrypt")]
+pub use decrypt::Decrypt;
 #[cfg(feature = "del")]
 pub use del::Del;
 #[cfg(feature = "downcase")]
@@ -269,10 +312,14 @@ pub use encode_key_value::EncodeKeyValue;
 pub use encode_logfmt::EncodeLogfmt;
 #[cfg(feature = "encode_percent")]
 pub use encode_percent::EncodePercent;
+#[cfg(feature = "encrypt")]
+pub use encrypt::Encrypt;
 #[cfg(feature = "ends_with")]
 pub use ends_with::EndsWith;
 #[cfg(feature = "exists")]
 pub use exists::Exists;
+#[cfg(feature = "find")]
+pub use find::Find;
 #[cfg(feature = "flatten")]
 pub use flatten::Flatten;
 #[cfg(feature = "float")]
@@ -285,6 +332,8 @@ pub use format_int::FormatInt;
 pub use format_number::FormatNumber;
 #[cfg(feature = "format_timestamp")]
 pub use format_timestamp::FormatTimestamp;
+#[cfg(feature = "get")]
+pub use get::Get;
 #[cfg(feature = "get_env_var")]
 pub use get_env_var::GetEnvVar;
 #[cfg(feature = "get_hostname")]
@@ -299,6 +348,10 @@ pub use ip_aton::IpAton;
 pub use ip_cidr_contains::IpCidrContains;
 #[cfg(feature = "ip_ntoa")]
 pub use ip_ntoa::IpNtoa;
+#[cfg(feature = "ip_ntop")]
+pub use ip_ntop::IpNtop;
+#[cfg(feature = "ip_pton")]
+pub use ip_pton::IpPton;
 #[cfg(feature = "ip_subnet")]
 pub use ip_subnet::IpSubnet;
 #[cfg(feature = "ip_to_ipv6")]
@@ -309,6 +362,8 @@ pub use ipv6_to_ipv4::Ipv6ToIpV4;
 pub use is_array::IsArray;
 #[cfg(feature = "is_boolean")]
 pub use is_boolean::IsBoolean;
+#[cfg(feature = "is_empty")]
+pub use is_empty::IsEmpty;
 #[cfg(feature = "is_float")]
 pub use is_float::IsFloat;
 #[cfg(feature = "is_integer")]
@@ -363,6 +418,8 @@ pub use parse_duration::ParseDuration;
 pub use parse_glog::ParseGlog;
 #[cfg(feature = "parse_grok")]
 pub use parse_grok::ParseGrok;
+#[cfg(feature = "parse_groks")]
+pub use parse_groks::ParseGroks;
 #[cfg(feature = "parse_int")]
 pub use parse_int::ParseInt;
 #[cfg(feature = "parse_json")]
@@ -393,18 +450,28 @@ pub use parse_timestamp::ParseTimestamp;
 pub use parse_tokens::ParseTokens;
 #[cfg(feature = "parse_url")]
 pub use parse_url::ParseUrl;
+#[cfg(feature = "parse_user_agent")]
+pub use parse_user_agent::ParseUserAgent;
 #[cfg(feature = "parse_xml")]
 pub use parse_xml::ParseXml;
 #[cfg(feature = "push")]
 pub use push::Push;
 #[cfg(feature = "match")]
 pub use r#match::Match;
+#[cfg(feature = "random_bytes")]
+pub use random_bytes::RandomBytes;
 #[cfg(feature = "redact")]
 pub use redact::Redact;
+#[cfg(feature = "remove")]
+pub use remove::Remove;
 #[cfg(feature = "replace")]
 pub use replace::Replace;
+#[cfg(feature = "reverse_dns")]
+pub use reverse_dns::ReverseDns;
 #[cfg(feature = "round")]
 pub use round::Round;
+#[cfg(feature = "set")]
+pub use set::Set;
 #[cfg(feature = "sha2")]
 pub use sha2::Sha2;
 #[cfg(feature = "sha3")]
@@ -421,8 +488,14 @@ pub use string::String;
 pub use strip_ansi_escape_codes::StripAnsiEscapeCodes;
 #[cfg(feature = "strip_whitespace")]
 pub use strip_whitespace::StripWhitespace;
+#[cfg(feature = "strlen")]
+pub use strlen::Strlen;
 #[cfg(feature = "tag_types_externally")]
 pub use tag_types_externally::TagTypesExternally;
+#[cfg(feature = "tally")]
+pub use tally::Tally;
+#[cfg(feature = "tally_value")]
+pub use tally_value::TallyValue;
 #[cfg(feature = "timestamp")]
 pub use timestamp::Timestamp;
 #[cfg(feature = "to_bool")]
@@ -447,6 +520,8 @@ pub use to_timestamp::ToTimestamp;
 pub use to_unix_timestamp::ToUnixTimestamp;
 #[cfg(feature = "truncate")]
 pub use truncate::Truncate;
+#[cfg(feature = "unique")]
+pub use unique::Unique;
 #[cfg(feature = "unnest")]
 pub use unnest::Unnest;
 #[cfg(feature = "upcase")]
@@ -456,10 +531,10 @@ pub use uuid_v4::UuidV4;
 
 pub fn all() -> Vec<Box<dyn vrl::Function>> {
     vec![
-        #[cfg(feature = "array")]
-        Box::new(Array),
         #[cfg(feature = "append")]
         Box::new(Append),
+        #[cfg(feature = "array")]
+        Box::new(Array),
         #[cfg(feature = "assert")]
         Box::new(Assert),
         #[cfg(feature = "assert_eq")]
@@ -476,6 +551,8 @@ pub fn all() -> Vec<Box<dyn vrl::Function>> {
         Box::new(DecodeBase64),
         #[cfg(feature = "decode_percent")]
         Box::new(DecodePercent),
+        #[cfg(feature = "decrypt")]
+        Box::new(Decrypt),
         #[cfg(feature = "del")]
         Box::new(Del),
         #[cfg(feature = "downcase")]
@@ -490,10 +567,14 @@ pub fn all() -> Vec<Box<dyn vrl::Function>> {
         Box::new(EncodeLogfmt),
         #[cfg(feature = "encode_percent")]
         Box::new(EncodePercent),
+        #[cfg(feature = "encrypt")]
+        Box::new(Encrypt),
         #[cfg(feature = "ends_with")]
         Box::new(EndsWith),
         #[cfg(feature = "exists")]
         Box::new(Exists),
+        #[cfg(feature = "find")]
+        Box::new(Find),
         #[cfg(feature = "flatten")]
         Box::new(Flatten),
         #[cfg(feature = "float")]
@@ -506,6 +587,8 @@ pub fn all() -> Vec<Box<dyn vrl::Function>> {
         Box::new(FormatNumber),
         #[cfg(feature = "format_timestamp")]
         Box::new(FormatTimestamp),
+        #[cfg(feature = "get")]
+        Box::new(Get),
         #[cfg(feature = "get_env_var")]
         Box::new(GetEnvVar),
         #[cfg(feature = "get_hostname")]
@@ -520,6 +603,10 @@ pub fn all() -> Vec<Box<dyn vrl::Function>> {
         Box::new(IpCidrContains),
         #[cfg(feature = "ip_ntoa")]
         Box::new(IpNtoa),
+        #[cfg(feature = "ip_ntop")]
+        Box::new(IpNtop),
+        #[cfg(feature = "ip_pton")]
+        Box::new(IpPton),
         #[cfg(feature = "ip_subnet")]
         Box::new(IpSubnet),
         #[cfg(feature = "ip_to_ipv6")]
@@ -530,6 +617,8 @@ pub fn all() -> Vec<Box<dyn vrl::Function>> {
         Box::new(IsArray),
         #[cfg(feature = "is_boolean")]
         Box::new(IsBoolean),
+        #[cfg(feature = "is_empty")]
+        Box::new(IsEmpty),
         #[cfg(feature = "is_float")]
         Box::new(IsFloat),
         #[cfg(feature = "is_integer")]
@@ -567,33 +656,35 @@ pub fn all() -> Vec<Box<dyn vrl::Function>> {
         #[cfg(feature = "now")]
         Box::new(Now),
         // We are not sure if this is the way we want to expose this functionality yet
-        // https://github.com/timberio/vector/issues/5607
+        // https://github.com/vectordotdev/vector/issues/5607
         //#[cfg(feature = "only_fields")]
         //Box::new(OnlyFields),
         #[cfg(feature = "object")]
         Box::new(Object),
+        #[cfg(feature = "parse_apache_log")]
+        Box::new(ParseApacheLog),
         #[cfg(feature = "parse_aws_alb_log")]
         Box::new(ParseAwsAlbLog),
         #[cfg(feature = "parse_aws_cloudwatch_log_subscription_message")]
         Box::new(ParseAwsCloudWatchLogSubscriptionMessage),
         #[cfg(feature = "parse_aws_vpc_flow_log")]
         Box::new(ParseAwsVpcFlowLog),
+        #[cfg(feature = "parse_common_log")]
+        Box::new(ParseCommonLog),
+        #[cfg(feature = "parse_csv")]
+        Box::new(ParseCsv),
         #[cfg(feature = "parse_duration")]
         Box::new(ParseDuration),
         #[cfg(feature = "parse_glog")]
         Box::new(ParseGlog),
         #[cfg(feature = "parse_grok")]
         Box::new(ParseGrok),
+        #[cfg(feature = "parse_groks")]
+        Box::new(ParseGroks),
         #[cfg(feature = "parse_int")]
         Box::new(ParseInt),
         #[cfg(feature = "parse_json")]
         Box::new(ParseJson),
-        #[cfg(feature = "parse_apache_log")]
-        Box::new(ParseApacheLog),
-        #[cfg(feature = "parse_common_log")]
-        Box::new(ParseCommonLog),
-        #[cfg(feature = "parse_csv")]
-        Box::new(ParseCsv),
         #[cfg(feature = "parse_key_value")]
         Box::new(ParseKeyValue),
         #[cfg(feature = "parse_klog")]
@@ -620,22 +711,26 @@ pub fn all() -> Vec<Box<dyn vrl::Function>> {
         Box::new(ParseTokens),
         #[cfg(feature = "parse_url")]
         Box::new(ParseUrl),
+        #[cfg(feature = "parse_user_agent")]
+        Box::new(ParseUserAgent),
         #[cfg(feature = "parse_xml")]
         Box::new(ParseXml),
         #[cfg(feature = "push")]
         Box::new(Push),
-        #[cfg(feature = "match")]
-        Box::new(Match),
-        #[cfg(feature = "match_any")]
-        Box::new(MatchAny),
-        #[cfg(feature = "match_array")]
-        Box::new(MatchArray),
+        #[cfg(feature = "random_bytes")]
+        Box::new(RandomBytes),
         #[cfg(feature = "redact")]
         Box::new(Redact),
+        #[cfg(feature = "remove")]
+        Box::new(Remove),
         #[cfg(feature = "replace")]
         Box::new(Replace),
+        #[cfg(feature = "reverse_dns")]
+        Box::new(ReverseDns),
         #[cfg(feature = "round")]
         Box::new(Round),
+        #[cfg(feature = "set")]
+        Box::new(Set),
         #[cfg(feature = "sha1")]
         Box::new(Sha1),
         #[cfg(feature = "sha2")]
@@ -654,6 +749,12 @@ pub fn all() -> Vec<Box<dyn vrl::Function>> {
         Box::new(StripAnsiEscapeCodes),
         #[cfg(feature = "strip_whitespace")]
         Box::new(StripWhitespace),
+        #[cfg(feature = "strlen")]
+        Box::new(Strlen),
+        #[cfg(feature = "tally")]
+        Box::new(Tally),
+        #[cfg(feature = "tally_value")]
+        Box::new(TallyValue),
         #[cfg(feature = "tag_types_externally")]
         Box::new(TagTypesExternally),
         #[cfg(feature = "timestamp")]
@@ -680,6 +781,8 @@ pub fn all() -> Vec<Box<dyn vrl::Function>> {
         Box::new(ToUnixTimestamp),
         #[cfg(feature = "truncate")]
         Box::new(Truncate),
+        #[cfg(feature = "unique")]
+        Box::new(Unique),
         #[cfg(feature = "unnest")]
         Box::new(Unnest),
         #[cfg(feature = "upcase")]

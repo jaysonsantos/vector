@@ -1,87 +1,83 @@
-use crate::expression::assignment;
-use crate::{parser::ast::Ident, TypeDef, Value};
+use anymap::AnyMap;
 use std::collections::HashMap;
 
-/// The state held by the compiler.
-///
-/// This state allows the compiler to track certain invariants during
-/// compilation, which in turn drives our progressive type checking system.
-#[derive(Clone, Default)]
-pub struct Compiler {
-    // stored external target type definition
-    target: Option<assignment::Details>,
+use value::Kind;
 
-    // stored internal variable type definitions
-    variables: HashMap<Ident, assignment::Details>,
+use crate::{expression::assignment, parser::ast::Ident, Value};
 
-    /// On request, the compiler can store its state in this field, which can
-    /// later be used to revert the compiler state to the previously stored
-    /// state.
-    ///
-    /// This is used by the compiler to try and parse part of an expression, but
-    /// back out of it if only part of the expression could be parsed. We still
-    /// want the parser to continue parsing, and so it can swap the failed
-    /// expression with a "no-op" one, but has to have a way for the compiler to
-    /// forget any state it started tracking while parsing the old, defunct
-    /// expression.
-    snapshot: Option<Box<Self>>,
+/// Local environment, limited to a given scope.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct LocalEnv {
+    pub(crate) bindings: HashMap<Ident, assignment::Details>,
 }
 
-impl Compiler {
-    /// Creates a new compiler that starts with an initial given typedef.
-    pub fn new_with_type_def(type_def: TypeDef) -> Self {
-        Self {
-            target: Some(assignment::Details {
-                type_def,
-                value: None,
-            }),
-            variables: HashMap::new(),
-            snapshot: None,
-        }
+impl LocalEnv {
+    pub(crate) fn variable_idents(&self) -> impl Iterator<Item = &Ident> + '_ {
+        self.bindings.keys()
     }
 
     pub(crate) fn variable(&self, ident: &Ident) -> Option<&assignment::Details> {
-        self.variables.get(ident)
+        self.bindings.get(ident)
     }
 
     pub(crate) fn insert_variable(&mut self, ident: Ident, details: assignment::Details) {
-        self.variables.insert(ident, details);
+        self.bindings.insert(ident, details);
+    }
+}
+
+/// A lexical scope within the program.
+#[derive(Debug)]
+pub struct ExternalEnv {
+    /// The external target of the program.
+    target: Option<assignment::Details>,
+
+    /// Custom context injected by the external environment
+    custom: AnyMap,
+}
+
+impl Default for ExternalEnv {
+    fn default() -> Self {
+        Self {
+            custom: AnyMap::new(),
+            target: None,
+        }
+    }
+}
+
+impl ExternalEnv {
+    /// Creates a new external environment that starts with an initial given
+    /// [`Kind`].
+    pub fn new_with_kind(kind: Kind) -> Self {
+        Self {
+            target: Some(assignment::Details {
+                type_def: kind.into(),
+                value: None,
+            }),
+            ..Default::default()
+        }
     }
 
     pub(crate) fn target(&self) -> Option<&assignment::Details> {
         self.target.as_ref()
     }
 
+    pub fn target_kind(&self) -> Option<&Kind> {
+        self.target().map(|details| details.type_def.kind())
+    }
+
     pub(crate) fn update_target(&mut self, details: assignment::Details) {
         self.target = Some(details);
     }
 
-    /// Take a snapshot of the current state of the compiler.
-    ///
-    /// This overwrites any existing snapshot currently stored.
-    pub(crate) fn snapshot(&mut self) {
-        let target = self.target.clone();
-        let variables = self.variables.clone();
-
-        let snapshot = Self {
-            target,
-            variables,
-            snapshot: None,
-        };
-
-        self.snapshot = Some(Box::new(snapshot));
+    /// Sets the external context data for VRL functions to use.
+    pub fn set_external_context<T: 'static>(&mut self, data: T) {
+        self.custom.insert::<T>(data);
     }
 
-    /// Roll back the compiler state to a previously stored snapshot.
-    pub(crate) fn rollback(&mut self) {
-        if let Some(snapshot) = self.snapshot.take() {
-            *self = *snapshot;
-        }
-    }
-
-    /// Returns the root typedef for the paths (not the variables) of the object.
-    pub fn target_type_def(&self) -> Option<&TypeDef> {
-        self.target.as_ref().map(|assignment| &assignment.type_def)
+    /// Swap the existing external contexts with new ones, returning the old ones.
+    #[must_use]
+    pub(crate) fn swap_external_context(&mut self, ctx: AnyMap) -> AnyMap {
+        std::mem::replace(&mut self.custom, ctx)
     }
 }
 
@@ -93,6 +89,14 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    pub fn is_empty(&self) -> bool {
+        self.variables.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.variables.clear();
+    }
+
     pub fn variable(&self, ident: &Ident) -> Option<&Value> {
         self.variables.get(ident)
     }

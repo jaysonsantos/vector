@@ -1,28 +1,35 @@
+use std::borrow::Cow::{self, Borrowed, Owned};
+
 use indoc::indoc;
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use prettytable::{format, Cell, Row, Table};
 use regex::Regex;
-use rustyline::completion::Completer;
-use rustyline::error::ReadlineError;
-use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
-use rustyline::hint::{Hinter, HistoryHinter};
-use rustyline::validate::{self, ValidationResult, Validator};
-use rustyline::{Context, Editor, Helper};
-use shared::TimeZone;
-use std::borrow::Cow::{self, Borrowed, Owned};
-use vrl::{diagnostic::Formatter, state, value, Runtime, Target, Value};
+use rustyline::{
+    completion::Completer,
+    error::ReadlineError,
+    highlight::{Highlighter, MatchingBracketHighlighter},
+    hint::{Hinter, HistoryHinter},
+    validate::{self, ValidationResult, Validator},
+    Context, Editor, Helper,
+};
+use vector_common::TimeZone;
+use vrl::{
+    diagnostic::Formatter,
+    state::{self, ExternalEnv},
+    value, Runtime, Target, Value, VrlRuntime,
+};
 
 // Create a list of all possible error values for potential docs lookup
-lazy_static! {
-    static ref ERRORS: Vec<String> = [
-        100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 203, 204, 205, 206, 207, 208, 209,
-        601, 300, 301, 302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 400, 401,
-        601, 620, 630, 640, 650, 660
+static ERRORS: Lazy<Vec<String>> = Lazy::new(|| {
+    [
+        100, 101, 102, 103, 104, 105, 106, 107, 108, 110, 203, 204, 205, 206, 207, 208, 209, 300,
+        301, 302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 400, 401, 402, 403,
+        601, 620, 630, 640, 650, 651, 652, 660, 701,
     ]
     .iter()
     .map(|i| i.to_string())
-    .collect();
-}
+    .collect()
+});
 
 const DOCS_URL: &str = "https://vector.dev/docs/reference/vrl";
 const ERRORS_URL_ROOT: &str = "https://errors.vrl.dev";
@@ -38,17 +45,21 @@ const RESERVED_TERMS: &[&str] = &[
     "help docs",
 ];
 
-pub(crate) fn run(mut objects: Vec<Value>, timezone: &TimeZone) {
+pub(crate) fn run(mut objects: Vec<Value>, timezone: &TimeZone, vrl_runtime: VrlRuntime) {
     let mut index = 0;
     let func_docs_regex = Regex::new(r"^help\sdocs\s(\w{1,})$").unwrap();
     let error_docs_regex = Regex::new(r"^help\serror\s(\w{1,})$").unwrap();
 
-    let mut compiler_state = state::Compiler::default();
+    let mut external_state = state::ExternalEnv::default();
+    let mut local_state = state::LocalEnv::default();
     let mut rt = Runtime::new(state::Runtime::default());
     let mut rl = Editor::<Repl>::new();
     rl.set_helper(Some(Repl::new()));
 
-    println!("{}", BANNER_TEXT);
+    #[allow(clippy::print_stdout)]
+    {
+        println!("{}", BANNER_TEXT);
+    }
 
     loop {
         let readline = rl.readline("$ ");
@@ -98,21 +109,33 @@ pub(crate) fn run(mut objects: Vec<Value>, timezone: &TimeZone) {
                     objects.get_mut(index),
                     &mut rt,
                     command,
-                    &mut compiler_state,
+                    &mut external_state,
+                    std::mem::take(&mut local_state),
                     timezone,
+                    vrl_runtime,
                 );
 
                 let string = match result {
-                    Ok(v) => v.to_string(),
+                    Ok((v, local)) => {
+                        let _ = std::mem::replace(&mut local_state, local);
+
+                        v.to_string()
+                    }
                     Err(v) => v.to_string(),
                 };
 
-                println!("{}\n", string);
+                #[allow(clippy::print_stdout)]
+                {
+                    println!("{}\n", string);
+                }
             }
             Err(ReadlineError::Interrupted) => break,
             Err(ReadlineError::Eof) => break,
             Err(err) => {
-                println!("unable to read line: {}", err);
+                #[allow(clippy::print_stdout)]
+                {
+                    println!("unable to read line: {}", err);
+                }
                 break;
             }
         }
@@ -123,23 +146,45 @@ fn resolve(
     object: Option<&mut impl Target>,
     runtime: &mut Runtime,
     program: &str,
-    state: &mut state::Compiler,
+    external: &mut state::ExternalEnv,
+    local: state::LocalEnv,
     timezone: &TimeZone,
-) -> Result<Value, String> {
+    vrl_runtime: VrlRuntime,
+) -> Result<(Value, state::LocalEnv), String> {
     let mut empty = value!({});
     let object = match object {
         None => &mut empty as &mut dyn Target,
         Some(object) => object,
     };
 
-    let program = match vrl::compile_with_state(program, &stdlib::all(), state) {
-        Ok(program) => program,
+    let (program, local) = match vrl::compile_for_repl(program, &stdlib::all(), external, local) {
+        Ok(result) => result,
         Err(diagnostics) => return Err(Formatter::new(program, diagnostics).colored().to_string()),
     };
 
-    runtime
-        .resolve(object, &program, timezone)
-        .map_err(|err| err.to_string())
+    execute(runtime, program, object, timezone, vrl_runtime).map(|value| (value, local))
+}
+
+fn execute(
+    runtime: &mut Runtime,
+    program: vrl::Program,
+    object: &mut dyn Target,
+    timezone: &TimeZone,
+    vrl_runtime: VrlRuntime,
+) -> Result<Value, String> {
+    let mut state = ExternalEnv::default();
+
+    match vrl_runtime {
+        VrlRuntime::Vm => {
+            let vm = runtime.compile(stdlib::all(), &program, &mut state)?;
+            runtime
+                .run_vm(&vm, object, timezone)
+                .map_err(|err| err.to_string())
+        }
+        VrlRuntime::Ast => runtime
+            .resolve(object, &program, timezone)
+            .map_err(|err| err.to_string()),
+    }
 }
 
 struct Repl {
@@ -239,11 +284,20 @@ impl Validator for Repl {
         ctx: &mut validate::ValidationContext,
     ) -> rustyline::Result<ValidationResult> {
         let timezone = TimeZone::default();
-        let mut compiler_state = state::Compiler::default();
+        let local_state = state::LocalEnv::default();
+        let mut external_state = state::ExternalEnv::default();
         let mut rt = Runtime::new(state::Runtime::default());
         let target: Option<&mut Value> = None;
 
-        let result = match resolve(target, &mut rt, ctx.input(), &mut compiler_state, &timezone) {
+        let result = match resolve(
+            target,
+            &mut rt,
+            ctx.input(),
+            &mut external_state,
+            local_state,
+            &timezone,
+            VrlRuntime::Ast,
+        ) {
             Err(error) => {
                 // TODO: Ideally we'd used typed errors for this, but
                 // that requires some more work to the VRL compiler.
@@ -293,16 +347,22 @@ fn print_function_list() {
 }
 
 fn print_help_text() {
-    println!("{}", HELP_TEXT);
+    #[allow(clippy::print_stdout)]
+    {
+        println!("{}", HELP_TEXT);
+    }
 }
 
 fn open_url(url: &str) {
     if let Err(err) = webbrowser::open(url) {
-        println!(
-            "couldn't open default web browser: {}\n\
+        #[allow(clippy::print_stdout)]
+        {
+            println!(
+                "couldn't open default web browser: {}\n\
             you can access the desired documentation at {}",
-            err, url
-        );
+                err, url
+            );
+        }
     }
 }
 
@@ -316,7 +376,10 @@ fn show_func_docs(line: &str, pattern: &Regex) {
         let func_url = format!("{}/functions/#{}", DOCS_URL, func_name);
         open_url(&func_url);
     } else {
-        println!("function name {} not recognized", func_name);
+        #[allow(clippy::print_stdout)]
+        {
+            println!("function name {} not recognized", func_name);
+        }
     }
 }
 
@@ -329,7 +392,10 @@ fn show_error_docs(line: &str, pattern: &Regex) {
         let error_code_url = format!("{}/{}", ERRORS_URL_ROOT, error_code);
         open_url(&error_code_url);
     } else {
-        println!("error code {} not recognized", error_code);
+        #[allow(clippy::print_stdout)]
+        {
+            println!("error code {} not recognized", error_code);
+        }
     }
 }
 

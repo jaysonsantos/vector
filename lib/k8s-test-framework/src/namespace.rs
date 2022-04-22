@@ -1,10 +1,14 @@
 //! Manage namespaces.
 
+use std::{
+    collections::BTreeMap,
+    process::{Command, Stdio},
+};
+
+use k8s_openapi::{api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::ObjectMeta};
+
 use super::{resource_file::ResourceFile, Result};
 use crate::up_down;
-use k8s_openapi::{api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::ObjectMeta};
-use std::collections::BTreeMap;
-use std::process::{Command, Stdio};
 
 /// A config that holds a test `Namespace` resource file.
 #[derive(Debug)]
@@ -71,7 +75,7 @@ pub fn make_namespace(name: String, labels: Option<BTreeMap<String, String>>) ->
     Namespace {
         metadata: ObjectMeta {
             name: Some(name),
-            labels: labels.unwrap_or_default(),
+            labels,
             ..Default::default()
         },
         spec: None,

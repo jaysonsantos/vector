@@ -1,17 +1,3 @@
-use crate::paths_provider::PathsProvider;
-use crate::{
-    checkpointer::{Checkpointer, CheckpointsView},
-    file_watcher::FileWatcher,
-    fingerprinter::{FileFingerprint, Fingerprinter},
-    FileSourceInternalEvents, ReadFrom,
-};
-use bytes::Bytes;
-use chrono::{DateTime, Utc};
-use futures::{
-    future::{select, Either, FutureExt},
-    stream, Future, Sink, SinkExt,
-};
-use indexmap::IndexMap;
 use std::{
     cmp,
     collections::{BTreeMap, HashSet},
@@ -20,8 +6,24 @@ use std::{
     sync::Arc,
     time::{self, Duration},
 };
+
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use futures::{
+    future::{select, Either, FutureExt},
+    stream, Future, Sink, SinkExt,
+};
+use indexmap::IndexMap;
 use tokio::time::sleep;
-use tracing::{debug, error, info, trace, trace_span, Instrument};
+use tracing::{debug, error, info, trace};
+
+use crate::{
+    checkpointer::{Checkpointer, CheckpointsView},
+    file_watcher::FileWatcher,
+    fingerprinter::{FileFingerprint, Fingerprinter},
+    paths_provider::PathsProvider,
+    FileSourceInternalEvents, ReadFrom,
+};
 
 /// `FileServer` is a Source which cooperatively schedules reads over files,
 /// converting the lines of said files into `LogLine` structures. As
@@ -152,10 +154,9 @@ where
                     let start = time::Instant::now();
                     match checkpointer.write_checkpoints() {
                         Ok(count) => emitter.emit_file_checkpointed(count, start.elapsed()),
-                        Err(error) => emitter.emit_file_checkpoint_write_failed(error),
+                        Err(error) => emitter.emit_file_checkpoint_write_error(error),
                     }
                 })
-                .instrument(trace_span!("writing checkpoints file"))
                 .await
                 .ok();
             }
@@ -172,13 +173,9 @@ where
         // or write new checkpoints, on every iteration.
         let mut next_glob_time = time::Instant::now();
         loop {
-            let _loop_span = trace_span!("file_server_iteration").entered();
-
             // Glob find files to follow, but not too often.
             let now_time = time::Instant::now();
             if next_glob_time <= now_time {
-                let _discovery_span = trace_span!("file_discovery").entered();
-
                 // Schedule the next glob time.
                 next_glob_time = now_time.checked_add(self.glob_minimum_cooldown).unwrap();
 
@@ -195,10 +192,7 @@ where
                 for (_file_id, watcher) in &mut fp_map {
                     watcher.set_file_findable(false); // assume not findable until found
                 }
-
-                let paths = trace_span!("paths_provider").in_scope(|| self.paths_provider.paths());
-
-                for path in paths.into_iter() {
+                for path in self.paths_provider.paths().into_iter() {
                     if let Some(file_id) = self.fingerprinter.get_fingerprint_or_log_error(
                         &path,
                         &mut fingerprint_buffer,
@@ -256,12 +250,9 @@ where
             }
 
             // Collect lines by polling files.
-            let reading_span = trace_span!("reading").entered();
             let mut global_bytes_read: usize = 0;
             let mut maxed_out_reading_single_file = false;
             for (&file_id, watcher) in &mut fp_map {
-                let _span = trace_span!("reading", path = ?watcher.path).entered();
-
                 if !watcher.should_read() {
                     continue;
                 }
@@ -269,10 +260,6 @@ where
                 let start = time::Instant::now();
                 let mut bytes_read: usize = 0;
                 while let Ok(Some(line)) = watcher.read_line() {
-                    if line.is_empty() {
-                        break;
-                    }
-
                     let sz = line.len();
                     trace!(
                         message = "Read bytes.",
@@ -311,7 +298,7 @@ where
                                 }
                                 Err(error) => {
                                     // We will try again after some time.
-                                    self.emitter.emit_file_delete_failed(&watcher.path, error);
+                                    self.emitter.emit_file_delete_error(&watcher.path, error);
                                 }
                             }
                         }
@@ -323,7 +310,6 @@ where
                     break;
                 }
             }
-            drop(reading_span);
 
             // A FileWatcher is dead when the underlying file has disappeared.
             // If the FileWatcher is dead we don't retain it; it will be deallocated.
@@ -341,11 +327,7 @@ where
             let start = time::Instant::now();
             let to_send = std::mem::take(&mut lines);
             let mut stream = stream::once(futures::future::ok(to_send));
-            let result = self.handle.block_on(
-                chans
-                    .send_all(&mut stream)
-                    .instrument(trace_span!("sending")),
-            );
+            let result = self.handle.block_on(chans.send_all(&mut stream));
             match result {
                 Ok(()) => {}
                 Err(error) => {
@@ -419,7 +401,7 @@ where
         // checkpoint was only loaded for new files when Vector was started up, but the
         // `kubernetes_logs` source returns the files well after start-up, once it has populated
         // them from the k8s metadata, so we now just always use the checkpoints unless opted out.
-        // https://github.com/timberio/vector/issues/7139
+        // https://github.com/vectordotdev/vector/issues/7139
         let read_from = if !self.ignore_checkpoints {
             checkpoints
                 .get(file_id)
@@ -445,7 +427,7 @@ where
                 watcher.set_file_findable(true);
                 fp_map.insert(file_id, watcher);
             }
-            Err(error) => self.emitter.emit_file_watch_failed(&path, error),
+            Err(error) => self.emitter.emit_file_watch_error(&path, error),
         };
     }
 }

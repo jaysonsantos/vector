@@ -1,9 +1,10 @@
-use pin_project::pin_project;
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
+
+use pin_project::pin_project;
 use tokio::io::{AsyncRead, ReadBuf, Result as IoResult};
 
 pub trait VecAsyncReadExt: AsyncRead {
@@ -33,7 +34,7 @@ pub struct AllowReadUntil<S, F> {
 }
 
 impl<S, F> AllowReadUntil<S, F> {
-    pub fn get_ref(&self) -> &S {
+    pub const fn get_ref(&self) -> &S {
         &self.reader
     }
 
@@ -62,12 +63,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::shutdown::ShutdownSignal;
-    use crate::test_util::temp_file;
     use futures::FutureExt;
-    use tokio::fs::{remove_file, File};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+    use tokio::{
+        fs::{remove_file, File},
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    };
+
+    use super::*;
+    use crate::{shutdown::ShutdownSignal, test_util::temp_file};
 
     #[tokio::test]
     async fn test_read_line_without_shutdown() {
@@ -82,7 +85,7 @@ mod tests {
         let mut reader = BufReader::new(read_file);
         let mut writer = BufWriter::new(write_file);
 
-        writer.write_all("First line\n".as_bytes()).await.unwrap();
+        writer.write_all(b"First line\n").await.unwrap();
         writer.flush().await.unwrap();
 
         // Test one of the AsyncBufRead extension functions
@@ -91,7 +94,7 @@ mod tests {
 
         assert_eq!("First line\n", line_one);
 
-        writer.write_all("Second line\n".as_bytes()).await.unwrap();
+        writer.write_all(b"Second line\n").await.unwrap();
         writer.flush().await.unwrap();
 
         let mut line_two = String::new();
@@ -115,7 +118,7 @@ mod tests {
         let mut reader = BufReader::new(read_file);
         let mut writer = BufWriter::new(write_file);
 
-        writer.write_all("First line\n".as_bytes()).await.unwrap();
+        writer.write_all(b"First line\n").await.unwrap();
         writer.flush().await.unwrap();
 
         // Test one of the AsyncBufRead extension functions
@@ -126,7 +129,7 @@ mod tests {
 
         drop(trigger_shutdown);
 
-        writer.write_all("Second line\n".as_bytes()).await.unwrap();
+        writer.write_all(b"Second line\n").await.unwrap();
         writer.flush().await.unwrap();
 
         let mut line_two = String::new();

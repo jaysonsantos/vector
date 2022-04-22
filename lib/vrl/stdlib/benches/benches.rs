@@ -1,21 +1,24 @@
-use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use criterion::{criterion_group, criterion_main, Criterion};
 use regex::Regex;
-use shared::btreemap;
+use vector_common::btreemap;
 use vrl::prelude::*;
 
 criterion_group!(
     name = benches;
     // encapsulates CI noise we saw in
-    // https://github.com/timberio/vector/pull/6408
+    // https://github.com/vectordotdev/vector/pull/6408
     config = Criterion::default().noise_threshold(0.05);
-    targets = assert,
+    targets = array,
+              assert,
               assert_eq,
+              r#bool,
               ceil,
               compact,
               contains,
               decode_base64,
               decode_percent,
+              decrypt,
               // TODO: Cannot pass a Path to bench_function
               //del,
               downcase,
@@ -24,25 +27,33 @@ criterion_group!(
               encode_json,
               encode_logfmt,
               encode_percent,
+              encrypt,
               ends_with,
               // TODO: Cannot pass a Path to bench_function
               //exists
+              find,
               flatten,
               floor,
+              float,
               format_int,
               format_number,
               format_timestamp,
+              get,
               get_env_var,
               get_hostname,
               includes,
+              int,
               ip_aton,
               ip_cidr_contains,
               ip_ntoa,
+              ip_ntop,
+              ip_pton,
               ip_subnet,
               ip_to_ipv6,
               ipv6_to_ipv4,
               is_array,
               is_boolean,
+              is_empty,
               is_float,
               is_integer,
               is_null,
@@ -62,6 +73,7 @@ criterion_group!(
               merge,
               // TODO: value is dynamic so we cannot assert equality
               //now,
+              object,
               parse_apache_log,
               parse_aws_alb_log,
               parse_aws_cloudwatch_log_subscription_message,
@@ -71,6 +83,7 @@ criterion_group!(
               parse_duration,
               parse_glog,
               parse_grok,
+              parse_groks,
               parse_key_value,
               parse_klog,
               parse_int,
@@ -84,19 +97,28 @@ criterion_group!(
               parse_timestamp,
               parse_tokens,
               parse_url,
+              parse_user_agent,
               parse_xml,
               push,
               redact,
+              remove,
               replace,
+              reverse_dns,
               round,
+              set,
               sha1,
               sha2,
               sha3,
               slice,
               split,
               starts_with,
+              string,
               strip_ansi_escape_codes,
               strip_whitespace,
+              strlen,
+              tally,
+              tally_value,
+              timestamp,
               to_bool,
               to_float,
               to_int,
@@ -108,13 +130,32 @@ criterion_group!(
               to_timestamp,
               to_unix_timestamp,
               truncate,
+              unique,
               // TODO: Cannot pass a Path to bench_function
               //unnest
               // TODO: value is dynamic so we cannot assert equality
               //uuidv4,
-              upcase
+              upcase,
 );
 criterion_main!(benches);
+
+bench_function! {
+    encrypt => vrl_stdlib::Encrypt;
+
+    test {
+        args: func_args![algorithm: value!("AES-128-OFB"), plaintext: value!("plaintext"), key: value!("1234567890123456"), iv: value!("1234567890123456") ],
+        want: Ok(value!(b"\x05\x10\xace\xb2(\xf5\x92\xaf")),
+    }
+}
+
+bench_function! {
+    decrypt => vrl_stdlib::Decrypt;
+
+    test {
+        args: func_args![algorithm: value!("AES-128-OFB"), ciphertext: value!(b"\x05\x10\xace\xb2(\xf5\x92\xaf"), key: value!("1234567890123456"), iv: value!("1234567890123456") ],
+        want: Ok(value!("plaintext")),
+    }
+}
 
 bench_function! {
     append => vrl_stdlib::Append;
@@ -122,6 +163,15 @@ bench_function! {
     arrays {
         args: func_args![value: value!([1, 2, 3]), items: value!([4, 5, 6])],
         want: Ok(value!([1, 2, 3, 4, 5, 6])),
+    }
+}
+
+bench_function! {
+    array => vrl_stdlib::Array;
+
+    array {
+        args: func_args![value: value!([1,2,3])],
+        want: Ok(value!([1,2,3])),
     }
 }
 
@@ -139,6 +189,15 @@ bench_function! {
 
     literal {
         args: func_args![left: value!(true), right: value!(true), message: "must be true"],
+        want: Ok(value!(true)),
+    }
+}
+
+bench_function! {
+    r#bool => vrl_stdlib::Boolean;
+
+    r#bool {
+        args: func_args![value: value!(true)],
         want: Ok(value!(true)),
     }
 }
@@ -336,6 +395,25 @@ bench_function! {
 }
 
 bench_function! {
+    find => vrl_stdlib::Find;
+
+    str_matching {
+        args: func_args![value: "foobarfoo", pattern: "bar"],
+        want: Ok(value!(3)),
+    }
+
+    str_too_long {
+        args: func_args![value: "foo", pattern: "foobar"],
+        want: Ok(value!(-1)),
+    }
+
+    regex_matching_start {
+        args: func_args![value: "foobar", pattern: Value::Regex(Regex::new("fo+z?").unwrap().into())],
+        want: Ok(value!(0)),
+    }
+}
+
+bench_function! {
     flatten => vrl_stdlib::Flatten;
 
     nested_map {
@@ -366,6 +444,15 @@ bench_function! {
 }
 
 bench_function! {
+    float => vrl_stdlib::Float;
+
+    float {
+        args: func_args![value: value!(1.2)],
+        want: Ok(value!(1.2)),
+    }
+}
+
+bench_function! {
     floor  => vrl_stdlib::Floor;
 
     literal {
@@ -382,7 +469,7 @@ bench_function! {
         want: Ok("42"),
     }
 
-    hexidecimal {
+    hexadecimal {
         args: func_args![value: 42, base: 16],
         want: Ok(value!("2a")),
     }
@@ -440,11 +527,39 @@ bench_function! {
 }
 
 bench_function! {
+    set => vrl_stdlib::Set;
+
+    single {
+        args: func_args![value: value!({ "foo": "bar" }), path: vec!["baz"], data: true],
+        want: Ok(value!({ "foo": "bar", "baz": true })),
+    }
+
+    nested {
+        args: func_args![value: value!({ "foo": { "bar": "baz" } }), path: vec!["foo", "bar", "qux"], data: 42],
+        want: Ok(value!({ "foo": { "bar": { "qux": 42 } } })),
+    }
+
+    indexing {
+        args: func_args![value: value!([0, 42, 91]), path: vec![3], data: 1],
+        want: Ok(value!([0, 42, 91, 1])),
+    }
+}
+
+bench_function! {
+    int => vrl_stdlib::Integer;
+
+    int {
+        args: func_args![value: value!(1)],
+        want: Ok(value!(1)),
+    }
+}
+
+bench_function! {
     ip_aton => vrl_stdlib::IpAton;
 
     valid {
         args: func_args![value: "1.2.3.4"],
-        want: Ok(value!(67305985)),
+        want: Ok(value!(16909060)),
     }
 }
 
@@ -466,8 +581,36 @@ bench_function! {
     ip_ntoa => vrl_stdlib::IpNtoa;
 
     valid {
-        args: func_args![value: 67305985],
+        args: func_args![value: 16909060],
         want: Ok(value!("1.2.3.4")),
+    }
+}
+
+bench_function! {
+    ip_ntop => vrl_stdlib::IpNtop;
+
+    ipv4 {
+        args: func_args![value: "1.2.3.4"],
+        want: Ok(value!("\x01\x02\x03\x04")),
+    }
+
+    ipv6 {
+        args: func_args![value: "102:304:506:708:90a:b0c:d0e:f10"],
+        want: Ok(value!("\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10")),
+    }
+}
+
+bench_function! {
+    ip_pton => vrl_stdlib::IpPton;
+
+    ipv4 {
+        args: func_args![value: "\x01\x02\x03\x04"],
+        want: Ok(value!("1.2.3.4")),
+    }
+
+    ipv6 {
+        args: func_args![value: "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10"],
+        want: Ok(value!("102:304:506:708:90a:b0c:d0e:f10")),
     }
 }
 
@@ -548,6 +691,35 @@ bench_function! {
     boolean {
         args: func_args![value: true],
         want: Ok(true),
+    }
+}
+
+bench_function! {
+    is_empty => vrl_stdlib::IsEmpty;
+
+    empty_array {
+        args: func_args![value: value!([])],
+        want: Ok(true),
+    }
+
+    non_empty_array {
+        args: func_args![value: value!([1, 2, 3])],
+        want: Ok(false),
+    }
+
+    empty_object {
+        args: func_args![value: value!({})],
+        want: Ok(true),
+    }
+
+    non_empty_object {
+        args: func_args![value: value!({"foo": "bar"})],
+        want: Ok(false),
+    }
+
+    string {
+        args: func_args![value: "foo"],
+        want: Ok(false),
     }
 }
 
@@ -708,6 +880,25 @@ bench_function! {
     literal {
         args: func_args![value: "ohno"],
         want: Ok(value!(null)),
+    }
+}
+
+bench_function! {
+    get => vrl_stdlib::Get;
+
+    single {
+        args: func_args![value: value!({ "foo": "bar" }), path: vec!["foo"]],
+        want: Ok("bar"),
+    }
+
+    nested {
+        args: func_args![value: value!({ "foo": { "bar": "baz" } }), path: vec!["foo", "bar"]],
+        want: Ok("baz"),
+    }
+
+    indexing {
+        args: func_args![value: value!([0, 42, 91]), path: vec![-2]],
+        want: Ok(42),
     }
 }
 
@@ -915,6 +1106,15 @@ bench_function! {
                 "grandchild2": "val2",
             },
         }))
+    }
+}
+
+bench_function! {
+    object => vrl_stdlib::Object;
+
+    object {
+        args: func_args![value: value!({"foo": "bar"})],
+        want: Ok(value!({"foo": "bar"})),
     }
 }
 
@@ -1167,6 +1367,32 @@ bench_function! {
 }
 
 bench_function! {
+    parse_groks => vrl_stdlib::ParseGroks;
+
+    simple {
+        args: func_args![
+            value: r##"2020-10-02T23:22:12.223222Z info hello world"##,
+            patterns: Value::Array(vec![
+                "%{common_prefix} %{_status} %{_message}".into(),
+                "%{common_prefix} %{_message}".into(),
+                ]),
+            aliases: value!({
+                common_prefix: "%{_timestamp} %{_loglevel}",
+                _timestamp: "%{TIMESTAMP_ISO8601:timestamp}",
+                _loglevel: "%{LOGLEVEL:level}",
+                _status: "%{POSINT:status}",
+                _message: "%{GREEDYDATA:message}"
+            })
+        ],
+        want: Ok(Value::from(btreemap! {
+            "timestamp" => "2020-10-02T23:22:12.223222Z",
+            "level" => "info",
+            "message" => "hello world"
+        }))
+    }
+}
+
+bench_function! {
     parse_int => vrl_stdlib::ParseInt;
 
     decimal {
@@ -1392,7 +1618,7 @@ bench_function! {
         want: Ok(value!({
             "severity": "info",
             "facility": "local7",
-            "timestamp": (Local.ymd(2020, 12, 28).and_hms_milli(16, 49, 7, 0).with_timezone(&Utc)),
+            "timestamp": (Utc.ymd(2020, 12, 28).and_hms_milli(16, 49, 7, 0)),
             "hostname": "plertrood-thinkpad-x220",
             "appname": "nginx",
             "message": r#"127.0.0.1 - - [28/Dec/2019:16:49:07 +0000] "GET / HTTP/1.1" 304 0 "-" "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:71.0) Gecko/20100101 Firefox/71.0""#,
@@ -1463,6 +1689,54 @@ bench_function! {
                         "path": "/",
                         "query": {},
                         "fragment": null,
+        }))
+    }
+}
+
+bench_function! {
+    parse_user_agent => vrl_stdlib::ParseUserAgent;
+
+    fast {
+        args: func_args![value: "Mozilla Firefox 1.0.1 Mozilla/5.0 (X11; U; Linux i686; de-DE; rv:1.7.6) Gecko/20050223 Firefox/1.0.1"],
+        want: Ok(value!({
+            "browser": {
+                "family": "Firefox",
+                "version": "1.0.1",
+            },
+            "device": {
+                "category": "pc",
+            },
+            "os": {
+                "family": "Linux",
+                "version": null,
+            },
+        }))
+    }
+
+    enriched {
+        args: func_args![value: "Opera/9.80 (J2ME/MIDP; Opera Mini/4.3.24214; iPhone; CPU iPhone OS 4_2_1 like Mac OS X; AppleWebKit/24.783; U; en) Presto/2.5.25 Version/10.54", mode: "enriched"],
+        want: Ok(value!({
+            "browser": {
+                "family": "Opera Mini",
+                "major": "4",
+                "minor": "3",
+                "patch": "24214",
+                "version": "10.54",
+            },
+            "device": {
+                "brand": "Apple",
+                "category": "smartphone",
+                "family": "iPhone",
+                "model": "iPhone",
+            },
+            "os": {
+                "family": "iOS",
+                "major": "4",
+                "minor": "2",
+                "patch": "1",
+                "patch_minor": null,
+                "version": "4.2.1",
+            },
         }))
     }
 }
@@ -1643,6 +1917,25 @@ bench_function! {
 }
 
 bench_function! {
+    remove => vrl_stdlib::Remove;
+
+    single {
+        args: func_args![value: value!({ "foo": "bar", "baz": true }), path: vec!["foo"]],
+        want: Ok(value!({ "baz": true })),
+    }
+
+    nested {
+        args: func_args![value: value!({ "foo": { "bar": "baz" } }), path: vec!["foo", "bar"]],
+        want: Ok(value!({ "foo": {} })),
+    }
+
+    indexing {
+        args: func_args![value: value!([0, 42, 91]), path: vec![-2]],
+        want: Ok(vec![0, 91]),
+    }
+}
+
+bench_function! {
     replace => vrl_stdlib::Replace;
 
     string {
@@ -1661,6 +1954,15 @@ bench_function! {
             with: "o",
         ],
         want: Ok("I like opples ond bononos")
+    }
+}
+
+bench_function! {
+    reverse_dns => vrl_stdlib::ReverseDns;
+
+    google {
+        args: func_args![value: value!("8.8.8.8")],
+        want: Ok(value!("dns.google")),
     }
 }
 
@@ -1747,6 +2049,15 @@ bench_function! {
 }
 
 bench_function! {
+    string => vrl_stdlib::String;
+
+    string {
+        args: func_args![value: "2"],
+        want: Ok("2")
+    }
+}
+
+bench_function! {
     strip_ansi_escape_codes => vrl_stdlib::StripAnsiEscapeCodes;
 
     literal {
@@ -1763,6 +2074,15 @@ bench_function! {
             value:" \u{3000}\u{205F}\u{202F}\u{A0}\u{9} ❤❤ hi there ❤❤  \u{9}\u{A0}\u{202F}\u{205F}\u{3000}"
         ],
         want: Ok("❤❤ hi there ❤❤")
+    }
+}
+
+bench_function! {
+    strlen => vrl_stdlib::Strlen;
+
+    literal {
+        args: func_args![value: "ñandú"],
+        want: Ok(5)
     }
 }
 
@@ -1832,6 +2152,38 @@ bench_function! {
     tag_null {
         args: func_args![value: Value::Null],
         want: Ok(Value::Null),
+    }
+}
+
+bench_function! {
+    tally => vrl_stdlib::Tally;
+
+    default {
+        args: func_args![
+            value: value!(["bar", "foo", "baz", "foo"]),
+        ],
+        want: Ok(value!({"bar": 1, "foo": 2, "baz": 1})),
+    }
+}
+
+bench_function! {
+    tally_value => vrl_stdlib::TallyValue;
+
+    default {
+        args: func_args![
+            array: value!(["bar", "foo", "baz", "foo"]),
+            value: "foo",
+        ],
+        want: Ok(value!(2)),
+    }
+}
+
+bench_function! {
+    timestamp => vrl_stdlib::Timestamp;
+
+    timestamp {
+        args: func_args![value: Utc.ymd(2021, 1, 1).and_hms_milli(0, 0, 0, 0)],
+        want: Ok(value!(Utc.ymd(2021, 1, 1).and_hms_milli(0, 0, 0, 0))),
     }
 }
 
@@ -2014,6 +2366,24 @@ bench_function! {
             ellipsis: false,
         ],
         want: Ok("Super"),
+    }
+}
+
+bench_function! {
+    unique => vrl_stdlib::Unique;
+
+    default {
+        args: func_args![
+            value: value!(["bar", "foo", "baz", "foo"]),
+        ],
+        want: Ok(value!(["bar", "foo", "baz"])),
+    }
+
+    mixed_values {
+        args: func_args![
+            value: value!(["foo", [1,2,3], "123abc", 1, true, [1,2,3], "foo", true, 1]),
+        ],
+        want: Ok(value!(["foo", [1,2,3], "123abc", 1, true])),
     }
 }
 

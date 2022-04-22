@@ -1,27 +1,29 @@
 #![allow(clippy::upper_case_acronyms)]
 
-use crate::BoxedSubscription;
 use graphql_client::GraphQLQuery;
+
+use crate::BoxedSubscription;
 
 /// Shorthand for a Chrono datetime, set to UTC.
 type DateTime = chrono::DateTime<chrono::Utc>;
 
-/// OutputEventsSubscription allows observability into the events that are
+/// OutputEventsByComponentIdPatternsSubscription allows observability into the events that are
 /// generated from component(s).
 #[derive(GraphQLQuery, Debug, Copy, Clone)]
 #[graphql(
     schema_path = "graphql/schema.json",
-    query_path = "graphql/subscriptions/output_events.graphql",
+    query_path = "graphql/subscriptions/output_events_by_component_id_patterns.graphql",
     response_derives = "Debug"
 )]
-pub struct OutputEventsSubscription;
+pub struct OutputEventsByComponentIdPatternsSubscription;
 
 /// Tap encoding format type that is more convenient to use for public clients than the
-/// generated `output_events_subscription::EventEncodingType`.
+/// generated `output_events_by_component_id_patterns_subscription::EventEncodingType`.
 #[derive(Debug, Clone, Copy)]
 pub enum TapEncodingFormat {
     Json,
     Yaml,
+    Logfmt,
 }
 
 /// String -> TapEncodingFormat, typically for parsing user input.
@@ -32,60 +34,57 @@ impl std::str::FromStr for TapEncodingFormat {
         match s {
             "json" => Ok(Self::Json),
             "yaml" => Ok(Self::Yaml),
+            "logfmt" => Ok(Self::Logfmt),
             _ => Err("Invalid encoding format".to_string()),
         }
     }
 }
 
 /// Map the public-facing `TapEncodingFormat` to the internal `EventEncodingType`.
-impl From<TapEncodingFormat> for output_events_subscription::EventEncodingType {
+impl From<TapEncodingFormat>
+    for output_events_by_component_id_patterns_subscription::EventEncodingType
+{
     fn from(encoding: TapEncodingFormat) -> Self {
         match encoding {
             TapEncodingFormat::Json => Self::JSON,
             TapEncodingFormat::Yaml => Self::YAML,
-        }
-    }
-}
-
-impl output_events_subscription::OutputEventsSubscriptionOutputEvents {
-    pub fn as_log(
-        &self,
-    ) -> Option<&output_events_subscription::OutputEventsSubscriptionOutputEventsOnLog> {
-        match self {
-            output_events_subscription::OutputEventsSubscriptionOutputEvents::Log(ev) => Some(ev),
-            _ => None,
+            TapEncodingFormat::Logfmt => Self::LOGFMT,
         }
     }
 }
 
 pub trait TapSubscriptionExt {
     /// Executes an output events subscription.
-    fn output_events_subscription(
+    fn output_events_by_component_id_patterns_subscription(
         &self,
-        component_names: Vec<String>,
+        outputs_patterns: Vec<String>,
+        inputs_patterns: Vec<String>,
         encoding: TapEncodingFormat,
         limit: i64,
         interval: i64,
-    ) -> crate::BoxedSubscription<OutputEventsSubscription>;
+    ) -> crate::BoxedSubscription<OutputEventsByComponentIdPatternsSubscription>;
 }
 
 impl TapSubscriptionExt for crate::SubscriptionClient {
     /// Executes an output events subscription.
-    fn output_events_subscription(
+    fn output_events_by_component_id_patterns_subscription(
         &self,
-        component_names: Vec<String>,
+        outputs_patterns: Vec<String>,
+        inputs_patterns: Vec<String>,
         encoding: TapEncodingFormat,
         limit: i64,
         interval: i64,
-    ) -> BoxedSubscription<OutputEventsSubscription> {
-        let request_body =
-            OutputEventsSubscription::build_query(output_events_subscription::Variables {
-                component_names,
+    ) -> BoxedSubscription<OutputEventsByComponentIdPatternsSubscription> {
+        let request_body = OutputEventsByComponentIdPatternsSubscription::build_query(
+            output_events_by_component_id_patterns_subscription::Variables {
+                outputs_patterns,
+                inputs_patterns: Some(inputs_patterns),
                 limit,
                 interval,
                 encoding: encoding.into(),
-            });
+            },
+        );
 
-        self.start::<OutputEventsSubscription>(&request_body)
+        self.start::<OutputEventsByComponentIdPatternsSubscription>(&request_body)
     }
 }

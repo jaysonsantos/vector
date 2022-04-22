@@ -1,32 +1,41 @@
-use super::InternalEvent;
-use hyper::StatusCode;
-use metrics::{counter, histogram};
-#[cfg(feature = "sources-prometheus")]
-use prometheus_parser::ParserError;
 #[cfg(feature = "sources-prometheus")]
 use std::borrow::Cow;
 use std::time::Instant;
 
+use super::prelude::{error_stage, error_type, http_error_code};
+use hyper::StatusCode;
+use metrics::{counter, histogram};
+#[cfg(feature = "sources-prometheus")]
+use prometheus_parser::ParserError;
+use vector_core::internal_event::InternalEvent;
+
 #[derive(Debug)]
-pub struct PrometheusEventReceived {
+pub struct PrometheusEventsReceived {
     pub byte_size: usize,
     pub count: usize,
     pub uri: http::Uri,
 }
 
-impl InternalEvent for PrometheusEventReceived {
-    fn emit_logs(&self) {
-        debug!(message = "Scraped events.", count = ?self.count);
-    }
-
-    fn emit_metrics(&self) {
-        counter!(
-            "events_in_total", self.count as u64,
-            "uri" => format!("{}",self.uri),
+impl InternalEvent for PrometheusEventsReceived {
+    fn emit(self) {
+        trace!(
+            message = "Events received.",
+            count = %self.count,
+            byte_size = %self.byte_size,
+            uri = %self.uri,
         );
         counter!(
-            "processed_bytes_total", self.byte_size as u64,
-            "uri" => format!("{}",self.uri),
+            "component_received_events_total", self.count as u64,
+            "uri" => self.uri.to_string(),
+        );
+        counter!(
+            "component_received_event_bytes_total", self.byte_size as u64,
+            "uri" => self.uri.to_string(),
+        );
+        // deprecated
+        counter!(
+            "events_in_total", self.count as u64,
+            "uri" => self.uri.to_string(),
         );
     }
 }
@@ -34,15 +43,12 @@ impl InternalEvent for PrometheusEventReceived {
 #[derive(Debug)]
 pub struct PrometheusRequestCompleted {
     pub start: Instant,
-    pub end: Instant,
+    pub(crate) end: Instant,
 }
 
 impl InternalEvent for PrometheusRequestCompleted {
-    fn emit_logs(&self) {
+    fn emit(self) {
         debug!(message = "Request completed.");
-    }
-
-    fn emit_metrics(&self) {
         counter!("requests_completed_total", 1);
         histogram!("request_duration_seconds", self.end - self.start);
     }
@@ -58,32 +64,55 @@ pub struct PrometheusParseError<'a> {
 
 #[cfg(feature = "sources-prometheus")]
 impl<'a> InternalEvent for PrometheusParseError<'a> {
-    fn emit_logs(&self) {
-        error!(message = "Parsing error.", url = %self.url, error = ?self.error);
+    fn emit(self) {
+        error!(
+            message = "Parsing error.",
+            url = %self.url,
+            error = ?self.error,
+            error_type = error_type::PARSER_FAILED,
+            stage = error_stage::PROCESSING,
+            internal_log_rate_secs = 10,
+        );
         debug!(
             message = %format!("Failed to parse response:\n\n{}\n\n", self.body),
             url = %self.url,
             internal_log_rate_secs = 10
         );
-    }
-
-    fn emit_metrics(&self) {
+        counter!(
+            "component_errors_total", 1,
+            "error_type" => error_type::PARSER_FAILED,
+            "stage" => error_stage::PROCESSING,
+            "url" => self.url.to_string(),
+        );
+        // deprecated
         counter!("parse_errors_total", 1);
     }
 }
 
 #[derive(Debug)]
-pub struct PrometheusErrorResponse {
+pub struct PrometheusHttpResponseError {
     pub code: hyper::StatusCode,
     pub url: http::Uri,
 }
 
-impl InternalEvent for PrometheusErrorResponse {
-    fn emit_logs(&self) {
-        error!(message = "HTTP error response.", url = %self.url, code = %self.code);
-    }
-
-    fn emit_metrics(&self) {
+impl InternalEvent for PrometheusHttpResponseError {
+    fn emit(self) {
+        error!(
+            message = "HTTP error response.",
+            url = %self.url,
+            stage = error_stage::RECEIVING,
+            error_type = error_type::REQUEST_FAILED,
+            error_code = %http_error_code(self.code.as_u16()),
+            internal_log_rate_secs = 10,
+        );
+        counter!(
+            "component_errors_total", 1,
+            "url" => self.url.to_string(),
+            "stage" => error_stage::RECEIVING,
+            "error_type" => error_type::REQUEST_FAILED,
+            "error_code" => http_error_code(self.code.as_u16()),
+        );
+        // deprecated
         counter!("http_error_response_total", 1);
     }
 }
@@ -95,11 +124,22 @@ pub struct PrometheusHttpError {
 }
 
 impl InternalEvent for PrometheusHttpError {
-    fn emit_logs(&self) {
-        error!(message = "HTTP request processing error.", url = %self.url, error = ?self.error);
-    }
-
-    fn emit_metrics(&self) {
+    fn emit(self) {
+        error!(
+            message = "HTTP request processing error.",
+            url = %self.url,
+            error = ?self.error,
+            error_type = error_type::REQUEST_FAILED,
+            stage = error_stage::RECEIVING,
+            internal_log_rate_secs = 10,
+        );
+        counter!(
+            "component_errors_total", 1,
+            "url" => self.url.to_string(),
+            "error_type" => error_type::REQUEST_FAILED,
+            "stage" => error_stage::RECEIVING,
+        );
+        // deprecated
         counter!("http_request_errors_total", 1);
     }
 }
@@ -110,23 +150,21 @@ pub struct PrometheusRemoteWriteParseError {
 }
 
 impl InternalEvent for PrometheusRemoteWriteParseError {
-    fn emit_logs(&self) {
-        error!(message = "Could not decode request body.", error = ?self.error);
-    }
-
-    fn emit_metrics(&self) {
+    fn emit(self) {
+        error!(
+            message = "Could not decode request body.",
+            error = ?self.error,
+            error_type = error_type::PARSER_FAILED,
+            stage = error_stage::PROCESSING,
+            internal_log_rate_secs = 10,
+        );
+        counter!(
+            "component_errors_total", 1,
+            "error_type" => error_type::PARSER_FAILED,
+            "stage" => error_stage::PROCESSING,
+        );
+        // deprecated
         counter!("parse_errors_total", 1);
-    }
-}
-
-#[derive(Debug)]
-pub struct PrometheusRemoteWriteReceived {
-    pub count: usize,
-}
-
-impl InternalEvent for PrometheusRemoteWriteReceived {
-    fn emit_logs(&self) {
-        debug!(message = "Received remote_write events.", count = ?self.count);
     }
 }
 
@@ -134,14 +172,22 @@ impl InternalEvent for PrometheusRemoteWriteReceived {
 pub struct PrometheusNoNameError;
 
 impl InternalEvent for PrometheusNoNameError {
-    fn emit_logs(&self) {
+    fn emit(self) {
         error!(
-            message = "Decoded timeseries is missing the __name__ field.",
-            internal_log_rate_secs = 5
+            message = "Could not decode timeseries.",
+            error = "Decoded timeseries is missing the __name__ field.",
+            error_code = "missing_name_field",
+            error_type = error_type::PARSER_FAILED,
+            stage = error_stage::PROCESSING,
+            internal_log_rate_secs = 10,
         );
-    }
-
-    fn emit_metrics(&self) {
+        counter!(
+            "component_errors_total", 1,
+            "error_code" => "missing_name_field",
+            "error_type" => error_type::PARSER_FAILED,
+            "stage" => error_stage::PROCESSING,
+        );
+        // deprecated
         counter!("parse_errors_total", 1);
     }
 }
@@ -152,16 +198,13 @@ pub struct PrometheusServerRequestComplete {
 }
 
 impl InternalEvent for PrometheusServerRequestComplete {
-    fn emit_logs(&self) {
+    fn emit(self) {
         let message = "Request to prometheus server complete.";
         if self.status_code.is_success() {
             debug!(message, status_code = %self.status_code);
         } else {
-            error!(message, status_code = %self.status_code);
+            warn!(message, status_code = %self.status_code);
         }
-    }
-
-    fn emit_metrics(&self) {
         counter!("requests_received_total", 1);
     }
 }

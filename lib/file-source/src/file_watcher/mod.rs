@@ -1,16 +1,18 @@
-use crate::buffer::read_until_with_max_size;
-use crate::metadata_ext::PortableFileExt;
-use crate::{FilePosition, ReadFrom};
-use bytes::{Bytes, BytesMut};
-use chrono::{DateTime, Utc};
-use flate2::bufread::MultiGzDecoder;
 use std::{
     fs::{self, File},
     io::{self, BufRead, Seek},
     path::PathBuf,
     time::{Duration, Instant},
 };
+
+use bytes::{Bytes, BytesMut};
+use chrono::{DateTime, Utc};
+use flate2::bufread::MultiGzDecoder;
 use tracing::debug;
+
+use crate::{
+    buffer::read_until_with_max_size, metadata_ext::PortableFileExt, FilePosition, ReadFrom,
+};
 #[cfg(test)]
 mod tests;
 
@@ -208,7 +210,13 @@ impl FileWatcher {
                     // File has been deleted, so return what we have in the buffer, even though it
                     // didn't end with a newline. This is not a perfect signal for when we should
                     // give up waiting for a newline, but it's decent.
-                    Ok(Some(self.buf.split().freeze()))
+                    let buf = self.buf.split().freeze();
+                    if buf.is_empty() {
+                        // EOF
+                        Ok(None)
+                    } else {
+                        Ok(Some(buf))
+                    }
                 } else {
                     Ok(None)
                 }

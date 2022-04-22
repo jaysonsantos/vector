@@ -8,7 +8,7 @@ use vector::{
 criterion_group!(
     name = benches;
     // encapsulates CI noise we saw in
-    // https://github.com/timberio/vector/issues/5394
+    // https://github.com/vectordotdev/vector/issues/5394
     config = Criterion::default().noise_threshold(0.05);
     targets = benchmark_add_fields, benchmark_multifaceted, benchmark_parse_json, benchmark_parse_syslog
 );
@@ -54,18 +54,6 @@ fn benchmark_add_fields(c: &mut Criterion) {
                   end
                   """
                   hooks.process = "process"
-            "#},
-        ),
-        (
-            "wasm",
-            indoc! {r#"
-                [transforms.last]
-                  type = "wasm"
-                  inputs = ["in"]
-                  module = "tests/data/wasm/add_fields/target/wasm32-wasi/release/add_fields.wasm"
-                  artifact_cache = "target/artifacts/"
-                  options.four = 4
-                  options.five = 5
             "#},
         ),
     ];
@@ -117,16 +105,6 @@ fn benchmark_parse_json(c: &mut Criterion) {
                   hooks.process = "process"
             "#},
         ),
-        (
-            "wasm",
-            indoc! {r#"
-                [transforms.last]
-                  type = "wasm"
-                  inputs = ["in"]
-                  module = "tests/data/wasm/parse_json/target/wasm32-wasi/release/parse_json.wasm"
-                  artifact_cache = "target/artifacts/"
-            "#},
-        ),
     ];
 
     let input =
@@ -162,6 +140,7 @@ fn benchmark_parse_syslog(c: &mut Criterion) {
                   types.level = "string"
                   types.message = "string"
                   types.msgid = "string"
+                  types.version = "int"
                   types.procid = "int"
                   types.timestamp = "timestamp|%Y-%m-%dT%H:%M:%S%.fZ"
             "#},
@@ -178,7 +157,7 @@ fn benchmark_parse_syslog(c: &mut Criterion) {
                     local pattern = "^<(%d+)>(%d+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (.+)$"
                     local priority, version, timestamp, hostname, appname, procid, msgid, sdata, message = string.match(message, pattern)
 
-                    return {priority = priority, version = version, timestamp = timestamp, hostname = hostname, appname = appname, procid = tonumber(procid), msgid = msgid, sdata = sdata, message = message}
+                    return {priority = priority, version = tonumber(version), timestamp = timestamp, hostname = hostname, appname = appname, procid = tonumber(procid), msgid = msgid, sdata = sdata, message = message}
                   end
 
                   function process(event, emit)
@@ -187,16 +166,6 @@ fn benchmark_parse_syslog(c: &mut Criterion) {
                   end
                   """
                   hooks.process = "process"
-            "#},
-        ),
-        (
-            "wasm",
-            indoc! {r#"
-                [transforms.last]
-                  type = "wasm"
-                  inputs = ["in"]
-                  module = "tests/data/wasm/parse_syslog/target/wasm32-wasi/release/parse_syslog.wasm"
-                  artifact_cache = "target/artifacts/"
             "#},
         ),
     ];
@@ -289,16 +258,6 @@ fn benchmark_multifaceted(c: &mut Criterion) {
                   hooks.process = "process"
             "#},
         ),
-        (
-            "wasm",
-            indoc! {r#"
-                [transforms.last]
-                  type = "wasm"
-                  inputs = ["in"]
-                  module = "tests/data/wasm/multifaceted/target/wasm32-wasi/release/multifaceted.wasm"
-                  artifact_cache = "target/artifacts/"
-            "#},
-        ),
     ];
 
     let input = r#"<12>3 2020-12-19T21:48:09.004Z initech.io su 4015 ID81 - TPS report missing cover sheet"#;
@@ -373,7 +332,7 @@ fn benchmark_configs(
                     config.push_str(&transform_config);
                     config.push_str(&sink_config);
 
-                    let config = config::load_from_str(&config, Some(config::Format::Toml))
+                    let config = config::load_from_str(&config, config::Format::Toml)
                         .expect(&format!("invalid TOML configuration: {}", &config));
                     let rt = runtime();
                     let (output_lines, topology) = rt.block_on(async move {

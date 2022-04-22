@@ -1,28 +1,42 @@
-use crate::async_read::VecAsyncReadExt;
-use crate::config::{DataType, SourceContext};
-use crate::event::LogEvent;
-use crate::internal_events::{ExecCommandExecuted, ExecTimeout};
-use crate::{
-    config::{log_schema, SourceConfig, SourceDescription},
-    event::Event,
-    internal_events::{ExecEventReceived, ExecFailed},
-    shutdown::ShutdownSignal,
-    Pipeline,
+use std::{
+    io::{Error, ErrorKind},
+    path::PathBuf,
+    process::ExitStatus,
 };
+
 use bytes::Bytes;
 use chrono::Utc;
-use futures::{FutureExt, SinkExt, StreamExt};
+use codecs::{
+    decoding::{DeserializerConfig, FramingConfig},
+    StreamDecodingError,
+};
+use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use snafu::Snafu;
-use std::io::{Error, ErrorKind};
-use std::path::PathBuf;
-use std::process::ExitStatus;
-use tokio::io::{AsyncRead, BufReader};
-use tokio::process::Command;
-use tokio::sync::mpsc::{channel, Sender};
-use tokio::time::{self, sleep, Duration, Instant};
+use tokio::{
+    io::{AsyncRead, BufReader},
+    process::Command,
+    sync::mpsc::{channel, Sender},
+    time::{self, sleep, Duration, Instant},
+};
 use tokio_stream::wrappers::IntervalStream;
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::codec::FramedRead;
+use vector_core::ByteSizeOf;
+
+use crate::{
+    async_read::VecAsyncReadExt,
+    codecs::{Decoder, DecodingConfig},
+    config::{log_schema, DataType, Output, SourceConfig, SourceContext, SourceDescription},
+    event::Event,
+    internal_events::{
+        ExecCommandExecuted, ExecEventsReceived, ExecFailedError, ExecTimeoutError,
+        StreamClosedError,
+    },
+    serde::{default_decoding, default_framing_stream_based},
+    shutdown::ShutdownSignal,
+    SourceSender,
+};
 
 pub mod sized_bytes_codec;
 
@@ -36,10 +50,12 @@ pub struct ExecConfig {
     pub working_directory: Option<PathBuf>,
     #[serde(default = "default_include_stderr")]
     pub include_stderr: bool,
-    #[serde(default = "default_events_per_line")]
-    pub event_per_line: bool,
     #[serde(default = "default_maximum_buffer_size")]
     pub maximum_buffer_size_bytes: usize,
+    #[serde(default = "default_framing_stream_based")]
+    framing: FramingConfig,
+    #[serde(default = "default_decoding")]
+    decoding: DeserializerConfig,
 }
 
 // TODO: Would be nice to combine the scheduled and streaming config with the mode enum once
@@ -86,34 +102,31 @@ impl Default for ExecConfig {
             command: vec!["echo".to_owned(), "Hello World!".to_owned()],
             working_directory: None,
             include_stderr: default_include_stderr(),
-            event_per_line: default_events_per_line(),
             maximum_buffer_size_bytes: default_maximum_buffer_size(),
+            framing: default_framing_stream_based(),
+            decoding: default_decoding(),
         }
     }
 }
 
-fn default_maximum_buffer_size() -> usize {
+const fn default_maximum_buffer_size() -> usize {
     // 1MB
     1000000
 }
 
-fn default_exec_interval_secs() -> u64 {
+const fn default_exec_interval_secs() -> u64 {
     60
 }
 
-fn default_respawn_interval_secs() -> u64 {
+const fn default_respawn_interval_secs() -> u64 {
     5
 }
 
-fn default_respawn_on_exit() -> bool {
+const fn default_respawn_on_exit() -> bool {
     true
 }
 
-fn default_include_stderr() -> bool {
-    true
-}
-
-fn default_events_per_line() -> bool {
+const fn default_include_stderr() -> bool {
     true
 }
 
@@ -149,21 +162,21 @@ impl ExecConfig {
         self.command.join(" ")
     }
 
-    fn exec_interval_secs_or_default(&self) -> u64 {
+    const fn exec_interval_secs_or_default(&self) -> u64 {
         match &self.scheduled {
             None => default_exec_interval_secs(),
             Some(config) => config.exec_interval_secs,
         }
     }
 
-    fn respawn_on_exit_or_default(&self) -> bool {
+    const fn respawn_on_exit_or_default(&self) -> bool {
         match &self.streaming {
             None => default_respawn_on_exit(),
             Some(config) => config.respawn_on_exit,
         }
     }
 
-    fn respawn_interval_secs_or_default(&self) -> u64 {
+    const fn respawn_interval_secs_or_default(&self) -> u64 {
         match &self.streaming {
             None => default_respawn_interval_secs(),
             Some(config) => config.respawn_interval_secs,
@@ -177,13 +190,16 @@ impl SourceConfig for ExecConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         self.validate()?;
         let hostname = get_hostname();
+        let decoder = DecodingConfig::new(self.framing.clone(), self.decoding.clone()).build();
         match &self.mode {
             Mode::Scheduled => {
                 let exec_interval_secs = self.exec_interval_secs_or_default();
+
                 Ok(Box::pin(run_scheduled(
                     self.clone(),
                     hostname,
                     exec_interval_secs,
+                    decoder,
                     cx.shutdown,
                     cx.out,
                 )))
@@ -191,11 +207,13 @@ impl SourceConfig for ExecConfig {
             Mode::Streaming => {
                 let respawn_on_exit = self.respawn_on_exit_or_default();
                 let respawn_interval_secs = self.respawn_interval_secs_or_default();
+
                 Ok(Box::pin(run_streaming(
                     self.clone(),
                     hostname,
                     respawn_on_exit,
                     respawn_interval_secs,
+                    decoder,
                     cx.shutdown,
                     cx.out,
                 )))
@@ -203,12 +221,16 @@ impl SourceConfig for ExecConfig {
         }
     }
 
-    fn output_type(&self) -> DataType {
-        DataType::Log
+    fn outputs(&self) -> Vec<Output> {
+        vec![Output::default(DataType::Log)]
     }
 
     fn source_type(&self) -> &'static str {
         EXEC
+    }
+
+    fn can_acknowledge(&self) -> bool {
+        false
     }
 }
 
@@ -216,8 +238,9 @@ async fn run_scheduled(
     config: ExecConfig,
     hostname: Option<String>,
     exec_interval_secs: u64,
+    decoder: Decoder,
     shutdown: ShutdownSignal,
-    out: Pipeline,
+    out: SourceSender,
 ) -> Result<(), ()> {
     debug!("Starting scheduled exec runs.");
     let schedule = Duration::from_secs(exec_interval_secs);
@@ -231,26 +254,27 @@ async fn run_scheduled(
             run_command(
                 config.clone(),
                 hostname.clone(),
+                decoder.clone(),
                 shutdown.clone(),
                 out.clone(),
             ),
-        );
+        )
+        .await;
 
-        let timeout_result = timeout.await;
-
-        match timeout_result {
+        match timeout {
             Ok(output) => {
                 if let Err(command_error) = output {
-                    emit!(ExecFailed {
+                    emit!(ExecFailedError {
                         command: config.command_line().as_str(),
                         error: command_error,
                     });
                 }
             }
-            Err(_) => {
-                emit!(ExecTimeout {
+            Err(error) => {
+                emit!(ExecTimeoutError {
                     command: config.command_line().as_str(),
                     elapsed_seconds: schedule.as_secs(),
+                    error,
                 });
             }
         }
@@ -265,8 +289,9 @@ async fn run_streaming(
     hostname: Option<String>,
     respawn_on_exit: bool,
     respawn_interval_secs: u64,
+    decoder: Decoder,
     shutdown: ShutdownSignal,
-    out: Pipeline,
+    out: SourceSender,
 ) -> Result<(), ()> {
     if respawn_on_exit {
         let duration = Duration::from_secs(respawn_interval_secs);
@@ -275,10 +300,16 @@ async fn run_streaming(
         loop {
             tokio::select! {
                 _ = shutdown.clone() => break, // will break early if a shutdown is started
-                output = run_command(config.clone(), hostname.clone(), shutdown.clone(), out.clone()) => {
+                output = run_command(
+                    config.clone(),
+                    hostname.clone(),
+                    decoder.clone(),
+                    shutdown.clone(),
+                    out.clone()
+                ) => {
                     // handle command finished
                     if let Err(command_error) = output {
-                        emit!(ExecFailed {
+                        emit!(ExecFailedError {
                             command: config.command_line().as_str(),
                             error: command_error,
                         });
@@ -297,10 +328,10 @@ async fn run_streaming(
             }
         }
     } else {
-        let output = run_command(config.clone(), hostname, shutdown, out).await;
+        let output = run_command(config.clone(), hostname, decoder, shutdown, out).await;
 
         if let Err(command_error) = output {
-            emit!(ExecFailed {
+            emit!(ExecFailedError {
                 command: config.command_line().as_str(),
                 error: command_error,
             });
@@ -313,8 +344,9 @@ async fn run_streaming(
 async fn run_command(
     config: ExecConfig,
     hostname: Option<String>,
+    decoder: Decoder,
     shutdown: ShutdownSignal,
-    mut out: Pipeline,
+    mut out: SourceSender,
 ) -> Result<Option<ExitStatus>, Error> {
     debug!("Starting command run.");
     let mut command = build_command(&config);
@@ -338,13 +370,7 @@ async fn run_command(
         let stderr = stderr.allow_read_until(shutdown.clone().map(|_| ()));
         let stderr_reader = BufReader::new(stderr);
 
-        spawn_reader_thread(
-            stderr_reader,
-            config.event_per_line,
-            config.maximum_buffer_size_bytes,
-            STDERR,
-            sender.clone(),
-        );
+        spawn_reader_thread(stderr_reader, decoder.clone(), STDERR, sender.clone());
     }
 
     let stdout = child
@@ -358,23 +384,23 @@ async fn run_command(
 
     let pid = child.id();
 
-    spawn_reader_thread(
-        stdout_reader,
-        config.event_per_line,
-        config.maximum_buffer_size_bytes,
-        STDOUT,
-        sender,
-    );
+    spawn_reader_thread(stdout_reader, decoder.clone(), STDOUT, sender);
 
-    while let Some((line, stream)) = receiver.recv().await {
-        let event = create_event(&config, &hostname, line, &Some(stream.to_string()), pid);
+    while let Some(((mut events, _byte_size), stream)) = receiver.recv().await {
+        let count = events.len();
+        emit!(ExecEventsReceived {
+            count,
+            command: config.command_line().as_str(),
+            byte_size: events.size_of(),
+        });
 
-        let _ = out
-            .send(event)
-            .await
-            .map_err(|_: crate::pipeline::ClosedError| {
-                error!(message = "Failed to forward events; downstream is closed.");
-            });
+        for event in &mut events {
+            handle_event(&config, &hostname, &Some(stream.to_string()), pid, event);
+        }
+        if let Err(error) = out.send_batch(events).await {
+            emit!(StreamClosedError { count, error });
+            break;
+        }
     }
 
     let elapsed = start.elapsed();
@@ -397,7 +423,6 @@ async fn run_command(
     };
 
     debug!("Finished command run.");
-    let _ = out.flush().await;
 
     result
 }
@@ -442,111 +467,84 @@ fn build_command(config: &ExecConfig) -> Command {
     command
 }
 
-fn create_event(
+fn handle_event(
     config: &ExecConfig,
     hostname: &Option<String>,
-    line: Bytes,
     data_stream: &Option<String>,
     pid: Option<u32>,
-) -> Event {
-    emit!(ExecEventReceived {
-        command: config.command_line().as_str(),
-        byte_size: line.len(),
-    });
-    let mut log_event = LogEvent::default();
+    event: &mut Event,
+) {
+    if let Event::Log(log) = event {
+        // Add timestamp
+        log.try_insert(log_schema().timestamp_key(), Utc::now());
 
-    // Add message
-    log_event.insert(log_schema().message_key(), line);
+        // Add source type
+        log.try_insert(log_schema().source_type_key(), Bytes::from(EXEC));
 
-    // Add timestamp
-    log_event.insert(log_schema().timestamp_key(), Utc::now());
+        // Add data stream of stdin or stderr (if needed)
+        if let Some(data_stream) = data_stream {
+            log.try_insert_flat(STREAM_KEY, data_stream.clone());
+        }
 
-    // Add source type
-    log_event.insert(log_schema().source_type_key(), Bytes::from(EXEC));
+        // Add pid (if needed)
+        if let Some(pid) = pid {
+            log.try_insert_flat(PID_KEY, pid as i64);
+        }
 
-    // Add data stream of stdin or stderr (if needed)
-    if let Some(data_stream) = data_stream {
-        log_event.insert(STREAM_KEY, data_stream.clone());
+        // Add hostname (if needed)
+        if let Some(hostname) = hostname {
+            log.try_insert(log_schema().host_key(), hostname.clone());
+        }
+
+        // Add command
+        log.try_insert_flat(COMMAND_KEY, config.command.clone());
     }
-
-    // Add pid (if needed)
-    if let Some(pid) = pid {
-        log_event.insert(PID_KEY, pid as i64);
-    }
-
-    // Add hostname (if needed)
-    if let Some(hostname) = hostname {
-        log_event.insert(log_schema().host_key(), hostname.clone());
-    }
-
-    // Add command
-    log_event.insert(COMMAND_KEY, config.command.clone());
-
-    Event::Log(log_event)
 }
 
 fn spawn_reader_thread<R: 'static + AsyncRead + Unpin + std::marker::Send>(
     reader: BufReader<R>,
-    event_per_line: bool,
-    buf_size: usize,
-    stream: &'static str,
-    sender: Sender<(Bytes, &'static str)>,
+    decoder: Decoder,
+    origin: &'static str,
+    sender: Sender<((SmallVec<[Event; 1]>, usize), &'static str)>,
 ) {
     // Start the green background thread for collecting
-    Box::pin(tokio::spawn(async move {
-        debug!("Start capturing {} command output.", stream);
+    let _ = Box::pin(tokio::spawn(async move {
+        debug!("Start capturing {} command output.", origin);
 
-        if event_per_line {
-            let codec = LinesCodec::new_with_max_length(buf_size);
-            let mut bytes_stream = FramedRead::new(reader, codec);
-            while let Some(result) = bytes_stream.next().await {
-                match result {
-                    Ok(read_line) => {
-                        let read_bytes = Bytes::from(read_line);
-                        if sender.send((read_bytes, stream)).await.is_err() {
-                            // If the receive half of the channel is closed, either due to close being
-                            // called or the Receiver handle dropping, the function returns an error.
-                            debug!("Receive channel closed, unable to send.");
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        // Added this match to log the error and continue reading the stream
-                        error!(message = "Error decoding lines.", %error);
+        let mut stream = FramedRead::new(reader, decoder);
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(next) => {
+                    if sender.send((next, origin)).await.is_err() {
+                        // If the receive half of the channel is closed, either due to close being
+                        // called or the Receiver handle dropping, the function returns an error.
+                        debug!("Receive channel closed, unable to send.");
+                        break;
                     }
                 }
-            }
-        } else {
-            let codec = sized_bytes_codec::SizedBytesCodec::new_with_max_length(buf_size);
-            let mut bytes_stream = FramedRead::new(reader, codec);
-            while let Some(result) = bytes_stream.next().await {
-                match result {
-                    Ok(read_line) => {
-                        let read_bytes = Bytes::from(read_line);
-                        if sender.send((read_bytes, stream)).await.is_err() {
-                            // If the receive half of the channel is closed, either due to close being
-                            // called or the Receiver handle dropping, the function returns an error.
-                            debug!("Receive channel closed, unable to send.");
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        // Added this match to log the error and continue reading the stream
-                        error!(message = "Error decoding bytes.", %error);
+                Err(error) => {
+                    // Error is logged by `crate::codecs::Decoder`, no further
+                    // handling is needed here.
+                    if !error.can_continue() {
+                        break;
                     }
                 }
             }
         }
 
-        debug!("Finished capturing {} command output.", stream);
+        debug!("Finished capturing {} command output.", origin);
     }));
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    #[cfg(not(target_os = "windows"))]
+    use futures::task::Poll;
+
     use super::*;
     use crate::test_util::trace_init;
-    use std::io::Cursor;
 
     #[test]
     fn test_generate_config() {
@@ -554,15 +552,15 @@ mod tests {
     }
 
     #[test]
-    fn test_scheduled_create_event() {
+    fn test_scheduled_handle_event() {
         let config = standard_scheduled_test_config();
         let hostname = Some("Some.Machine".to_string());
-        let line = Bytes::from("hello world");
         let data_stream = Some(STDOUT.to_string());
         let pid = Some(8888_u32);
 
-        let event = create_event(&config, &hostname, line, &data_stream, pid);
-        let log = event.into_log();
+        let mut event = Bytes::from("hello world").into();
+        handle_event(&config, &hostname, &data_stream, pid, &mut event);
+        let log = event.as_log();
 
         assert_eq!(log[log_schema().host_key()], "Some.Machine".into());
         assert_eq!(log[STREAM_KEY], STDOUT.into());
@@ -570,19 +568,19 @@ mod tests {
         assert_eq!(log[COMMAND_KEY], config.command.into());
         assert_eq!(log[log_schema().message_key()], "hello world".into());
         assert_eq!(log[log_schema().source_type_key()], "exec".into());
-        assert_ne!(log[log_schema().timestamp_key()], "".into());
+        assert!(log.get(log_schema().timestamp_key()).is_some());
     }
 
     #[test]
     fn test_streaming_create_event() {
         let config = standard_streaming_test_config();
         let hostname = Some("Some.Machine".to_string());
-        let line = Bytes::from("hello world");
         let data_stream = Some(STDOUT.to_string());
         let pid = Some(8888_u32);
 
-        let event = create_event(&config, &hostname, line, &data_stream, pid);
-        let log = event.into_log();
+        let mut event = Bytes::from("hello world").into();
+        handle_event(&config, &hostname, &data_stream, pid, &mut event);
+        let log = event.as_log();
 
         assert_eq!(log[log_schema().host_key()], "Some.Machine".into());
         assert_eq!(log[STREAM_KEY], STDOUT.into());
@@ -590,7 +588,7 @@ mod tests {
         assert_eq!(log[COMMAND_KEY], config.command.into());
         assert_eq!(log[log_schema().message_key()], "hello world".into());
         assert_eq!(log[log_schema().source_type_key()], "exec".into());
-        assert_ne!(log[log_schema().timestamp_key()], "".into());
+        assert!(log.get(log_schema().timestamp_key()).is_some());
     }
 
     #[test]
@@ -605,8 +603,9 @@ mod tests {
             command: vec!["./runner".to_owned(), "arg1".to_owned(), "arg2".to_owned()],
             working_directory: Some(PathBuf::from("/tmp")),
             include_stderr: default_include_stderr(),
-            event_per_line: default_events_per_line(),
             maximum_buffer_size_bytes: default_maximum_buffer_size(),
+            framing: default_framing_stream_based(),
+            decoding: default_decoding(),
         };
 
         let command = build_command(&config);
@@ -624,109 +623,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_reader_thread_per_line() {
+    async fn test_spawn_reader_thread() {
         trace_init();
 
         let buf = Cursor::new("hello world\nhello rocket 🚀");
         let reader = BufReader::new(buf);
+        let decoder = crate::codecs::Decoder::default();
         let (sender, mut receiver) = channel(1024);
 
-        spawn_reader_thread(reader, true, 88888, STDOUT, sender);
+        spawn_reader_thread(reader, decoder, STDOUT, sender);
 
         let mut counter = 0;
-        if let Some((line, stream)) = receiver.recv().await {
-            assert_eq!(Bytes::from("hello world"), line);
-            assert_eq!(STDOUT, stream);
+        if let Some(((events, byte_size), origin)) = receiver.recv().await {
+            assert_eq!(byte_size, 11);
+            assert_eq!(events.len(), 1);
+            let log = events[0].as_log();
+            assert_eq!(
+                log[log_schema().message_key()],
+                Bytes::from("hello world").into()
+            );
+            assert_eq!(origin, STDOUT);
             counter += 1;
         }
 
-        if let Some((line, stream)) = receiver.recv().await {
-            assert_eq!(Bytes::from("hello rocket 🚀"), line);
-            assert_eq!(STDOUT, stream);
+        if let Some(((events, byte_size), origin)) = receiver.recv().await {
+            assert_eq!(byte_size, 17);
+            assert_eq!(events.len(), 1);
+            let log = events[0].as_log();
+            assert_eq!(
+                log[log_schema().message_key()],
+                Bytes::from("hello rocket 🚀").into()
+            );
+            assert_eq!(origin, STDOUT);
             counter += 1;
         }
 
         assert_eq!(counter, 2);
-    }
-
-    #[tokio::test]
-    async fn test_spawn_reader_thread_per_line_tiny_buffer() {
-        trace_init();
-
-        let buf = Cursor::new("hello\nhello world\nok\n");
-        let reader = BufReader::new(buf);
-        let (sender, mut receiver) = channel(1024);
-
-        spawn_reader_thread(reader, true, 6, STDOUT, sender);
-
-        let mut counter = 0;
-
-        if let Some((line, stream)) = receiver.recv().await {
-            assert_eq!(Bytes::from("hello"), line);
-            assert_eq!(STDOUT, stream);
-            counter += 1;
-        }
-
-        if let Some((line, stream)) = receiver.recv().await {
-            assert_eq!(Bytes::from("ok"), line);
-            assert_eq!(STDOUT, stream);
-            counter += 1;
-        }
-
-        // We should get two lines as the middle one is discarded for being too long
-        assert_eq!(counter, 2);
-    }
-
-    #[tokio::test]
-    async fn test_spawn_reader_thread_per_blob() {
-        trace_init();
-
-        let buf = Cursor::new("hello world\nhello rocket 🚀");
-        let reader = BufReader::new(buf);
-        let (sender, mut receiver) = channel(1024);
-
-        spawn_reader_thread(reader, false, 88888, STDOUT, sender);
-
-        let mut counter = 0;
-        if let Some((line, stream)) = receiver.recv().await {
-            assert_eq!(Bytes::from("hello world\nhello rocket 🚀"), line);
-            assert_eq!(STDOUT, stream);
-            counter += 1;
-        }
-
-        assert_eq!(counter, 1);
-    }
-
-    #[tokio::test]
-    async fn test_spawn_reader_thread_per_blob_tiny_buffer() {
-        trace_init();
-
-        let buf = Cursor::new("stream 🐟 888");
-        let reader = BufReader::new(buf);
-        let (sender, mut receiver) = channel(1024);
-
-        spawn_reader_thread(reader, false, 6, STDOUT, sender);
-
-        let mut counter = 0;
-        if let Some((line, stream)) = receiver.recv().await {
-            assert_eq!(Bytes::from("stream"), line);
-            assert_eq!(STDOUT, stream);
-            counter += 1;
-        }
-
-        if let Some((line, stream)) = receiver.recv().await {
-            assert_eq!(Bytes::from(" 🐟 "), line);
-            assert_eq!(STDOUT, stream);
-            counter += 1;
-        }
-
-        if let Some((line, stream)) = receiver.recv().await {
-            assert_eq!(Bytes::from("888"), line);
-            assert_eq!(STDOUT, stream);
-            counter += 1;
-        }
-
-        assert_eq!(counter, 3);
     }
 
     #[tokio::test]
@@ -735,13 +667,14 @@ mod tests {
         trace_init();
         let config = standard_scheduled_test_config();
         let hostname = Some("Some.Machine".to_string());
-        let (tx, mut rx) = Pipeline::new_test();
+        let decoder = Default::default();
         let shutdown = ShutdownSignal::noop();
+        let (tx, mut rx) = SourceSender::new_test();
 
         // Wait for our task to finish, wrapping it in a timeout
         let timeout = tokio::time::timeout(
             time::Duration::from_secs(5),
-            run_command(config.clone(), hostname, shutdown, tx),
+            run_command(config.clone(), hostname, decoder, shutdown, tx),
         );
 
         let timeout_result = timeout.await;
@@ -751,15 +684,15 @@ mod tests {
             .expect("command error");
         assert_eq!(0_i32, exit_status.unwrap().code().unwrap());
 
-        if let Ok(Some(event)) = rx.try_next() {
+        if let Poll::Ready(Some(event)) = futures::poll!(rx.next()) {
             let log = event.as_log();
             assert_eq!(log[COMMAND_KEY], config.command.clone().into());
             assert_eq!(log[STREAM_KEY], STDOUT.into());
             assert_eq!(log[log_schema().source_type_key()], "exec".into());
             assert_eq!(log[log_schema().message_key()], "Hello World!".into());
             assert_eq!(log[log_schema().host_key()], "Some.Machine".into());
-            assert_ne!(log[PID_KEY], "".into());
-            assert_ne!(log[log_schema().timestamp_key()], "".into());
+            assert!(log.get(PID_KEY).is_some());
+            assert!(log.get(log_schema().timestamp_key()).is_some());
 
             assert_eq!(8, log.all_fields().count());
         } else {
@@ -782,8 +715,9 @@ mod tests {
             command: vec!["yes".to_owned()],
             working_directory: None,
             include_stderr: default_include_stderr(),
-            event_per_line: default_events_per_line(),
             maximum_buffer_size_bytes: default_maximum_buffer_size(),
+            framing: default_framing_stream_based(),
+            decoding: default_decoding(),
         }
     }
 }

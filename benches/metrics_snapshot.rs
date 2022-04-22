@@ -2,7 +2,7 @@ use criterion::{criterion_group, BenchmarkId, Criterion};
 
 fn benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("metrics_snapshot");
-    // https://github.com/timberio/vector/runs/1746002475
+    // https://github.com/vectordotdev/vector/runs/1746002475
     group.noise_threshold(0.02);
     for &cardinality in [0, 1, 10, 100, 1000, 10000].iter() {
         group.bench_with_input(
@@ -10,7 +10,7 @@ fn benchmark(c: &mut Criterion) {
             &cardinality,
             |b, &cardinality| {
                 let controller = prepare_metrics(cardinality);
-                b.iter(|| vector::metrics::capture_metrics(controller));
+                b.iter(|| controller.capture_metrics());
             },
         );
     }
@@ -18,12 +18,12 @@ fn benchmark(c: &mut Criterion) {
 }
 
 fn prepare_metrics(cardinality: usize) -> &'static vector::metrics::Controller {
-    let _ = vector::metrics::init();
-    let controller = vector::metrics::get_controller().unwrap();
-    vector::metrics::reset(controller);
+    let _ = vector::metrics::init_test();
+    let controller = vector::metrics::Controller::get().unwrap();
+    controller.reset();
 
     for idx in 0..cardinality {
-        metrics::counter!("test", 1, "idx" => format!("{}", idx));
+        metrics::counter!("test", 1, "idx" => idx.to_string());
     }
 
     controller

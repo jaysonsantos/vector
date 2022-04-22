@@ -1,19 +1,3 @@
-use crate::{
-    event::Event,
-    internal_events::{
-        SocketEventReceived, SocketMode, UnixSocketError, UnixSocketFileDeleteFailed,
-    },
-    shutdown::ShutdownSignal,
-    sources::Source,
-    Pipeline,
-};
-use bytes::{Buf, Bytes, BytesMut};
-use futures::{
-    executor::block_on,
-    future,
-    sink::{Sink, SinkExt},
-    stream::{self, StreamExt, TryStreamExt},
-};
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
 use std::{
@@ -28,11 +12,29 @@ use std::{
     thread,
     time::Duration,
 };
+
+use bytes::{Buf, Bytes, BytesMut};
+use futures::{
+    executor::block_on,
+    future,
+    sink::{Sink, SinkExt},
+    stream::{self, StreamExt, TryStreamExt},
+};
 use tokio::{self, net::UnixListener, task::JoinHandle};
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::codec::{length_delimited, Framed};
 use tracing::field;
 use tracing_futures::Instrument;
+
+use crate::{
+    event::Event,
+    internal_events::{
+        SocketEventsReceived, SocketMode, UnixSocketError, UnixSocketFileDeleteError,
+    },
+    shutdown::ShutdownSignal,
+    sources::Source,
+    SourceSender,
+};
 
 const FSTRM_CONTROL_FRAME_LENGTH_MAX: usize = 512;
 const FSTRM_CONTROL_FIELD_CONTENT_TYPE_LENGTH_MAX: usize = 256;
@@ -51,7 +53,7 @@ struct FrameStreamState {
     is_bidirectional: bool,
 }
 impl FrameStreamState {
-    fn new() -> Self {
+    const fn new() -> Self {
         FrameStreamState {
             expect_control_frame: false,
             //first control frame should be READY (if bidirectional -- if unidirectional first will be START)
@@ -93,7 +95,7 @@ impl ControlHeader {
         }
     }
 
-    fn to_u32(self) -> u32 {
+    const fn to_u32(self) -> u32 {
         match self {
             ControlHeader::Accept => 0x01,
             ControlHeader::Start => 0x02,
@@ -118,7 +120,7 @@ impl ControlField {
             }
         }
     }
-    fn to_u32(&self) -> u32 {
+    const fn to_u32(&self) -> u32 {
         match self {
             ControlField::ContentType => 0x01,
         }
@@ -155,9 +157,10 @@ impl FrameStreamReader {
         } else {
             //data frame
             if self.state.control_state == ControlState::ReadingData {
-                emit!(SocketEventReceived {
-                    byte_size: frame.len(),
+                emit!(SocketEventsReceived {
                     mode: SocketMode::Unix,
+                    byte_size: frame.len(),
+                    count: 1
                 });
                 Some(frame) //return data frame
             } else {
@@ -364,11 +367,9 @@ pub trait FrameHandler {
 pub fn build_framestream_unix_source(
     frame_handler: impl FrameHandler + Send + Sync + Clone + 'static,
     shutdown: ShutdownSignal,
-    out: Pipeline,
+    out: SourceSender,
 ) -> crate::Result<Source> {
     let path = frame_handler.socket_path();
-
-    let out = out.sink_map_err(|e| error!("Error sending event: {:?}.", e));
 
     //check if the path already exists (and try to delete it)
     match fs::metadata(&path) {
@@ -486,7 +487,7 @@ pub fn build_framestream_unix_source(
                 .take_until(shutdown.clone())
                 .map_err(move |error| {
                     emit!(UnixSocketError {
-                        error,
+                        error: &error,
                         path: &listen_path,
                     });
                 })
@@ -498,18 +499,17 @@ pub fn build_framestream_unix_source(
                 });
             if !frame_handler.multithreaded() {
                 let mut events = frames.filter_map(move |f| {
-                    future::ready(
-                        frame_handler_copy
-                            .handle_event(received_from.clone(), f)
-                            .map(Ok),
-                    )
+                    future::ready(frame_handler_copy.handle_event(received_from.clone(), f))
                 });
 
                 let handler = async move {
-                    let _ = event_sink.send_all(&mut events).await;
+                    if let Err(e) = event_sink.send_event_stream(&mut events).await {
+                        error!("Error sending event: {:?}.", e);
+                    }
+
                     info!("Finished sending.");
                 };
-                tokio::spawn(handler.instrument(span));
+                tokio::spawn(handler.instrument(span.or_current()));
             } else {
                 let handler = async move {
                     frames
@@ -535,7 +535,7 @@ pub fn build_framestream_unix_source(
                         .await;
                     info!("Finished sending.");
                 };
-                tokio::spawn(handler.instrument(span));
+                tokio::spawn(handler.instrument(span.or_current()));
             }
         }
 
@@ -544,7 +544,7 @@ pub fn build_framestream_unix_source(
 
         // Delete socket file
         if let Err(error) = fs::remove_file(&path) {
-            emit!(UnixSocketFileDeleteFailed { path: &path, error });
+            emit!(UnixSocketFileDeleteError { path: &path, error });
         }
 
         Ok(())
@@ -553,23 +553,20 @@ pub fn build_framestream_unix_source(
     Ok(Box::pin(fut))
 }
 
-fn spawn_event_handling_tasks<S>(
+fn spawn_event_handling_tasks(
     event_data: Bytes,
     event_handler: impl FrameHandler + Send + Sync + 'static,
-    mut event_sink: S,
+    mut event_sink: SourceSender,
     received_from: Option<Bytes>,
     active_task_nums: Arc<AtomicU32>,
     max_frame_handling_tasks: u32,
-) -> JoinHandle<()>
-where
-    S: Sink<Event> + Send + Unpin + 'static,
-{
+) -> JoinHandle<()> {
     wait_for_task_quota(&active_task_nums, max_frame_handling_tasks);
 
     tokio::spawn(async move {
         future::ready({
             if let Some(evt) = event_handler.handle_event(received_from, event_data) {
-                if event_sink.send(evt).await.is_err() {
+                if event_sink.send_event(evt).await.is_err() {
                     error!("Encountered error while sending event.");
                 }
             }
@@ -588,21 +585,6 @@ fn wait_for_task_quota(active_task_nums: &Arc<AtomicU32>, max_tasks: u32) {
 
 #[cfg(test)]
 mod test {
-    use super::{
-        build_framestream_unix_source, spawn_event_handling_tasks, ControlField, ControlHeader,
-        FrameHandler,
-    };
-    use crate::{
-        config::log_schema,
-        test_util::{collect_n, collect_n_stream},
-    };
-    use crate::{event::Event, shutdown::SourceShutdownCoordinator, Pipeline};
-    use bytes::{buf::Buf, Bytes, BytesMut};
-    use futures::{
-        future,
-        sink::{Sink, SinkExt},
-        stream::{self, StreamExt},
-    };
     #[cfg(unix)]
     use std::{
         path::PathBuf,
@@ -612,6 +594,13 @@ mod test {
         },
         thread,
     };
+
+    use bytes::{buf::Buf, Bytes, BytesMut};
+    use futures::{
+        future,
+        sink::{Sink, SinkExt},
+        stream::{self, StreamExt},
+    };
     use tokio::{
         self,
         net::UnixStream,
@@ -619,6 +608,18 @@ mod test {
         time::{Duration, Instant},
     };
     use tokio_util::codec::{length_delimited, Framed};
+
+    use super::{
+        build_framestream_unix_source, spawn_event_handling_tasks, ControlField, ControlHeader,
+        FrameHandler,
+    };
+    use crate::{
+        config::{log_schema, ComponentKey},
+        event::Event,
+        shutdown::SourceShutdownCoordinator,
+        test_util::{collect_n, collect_n_stream},
+        SourceSender,
+    };
 
     #[derive(Clone)]
     struct MockFrameHandler<F: Send + Sync + Clone + FnOnce() + 'static> {
@@ -667,7 +668,7 @@ mod test {
                 .as_mut_log()
                 .insert(log_schema().source_type_key(), "framestream");
             if let Some(host) = received_from {
-                event.as_mut_log().insert(self.host_key(), host);
+                event.as_mut_log().insert(self.host_key().as_str(), host);
             }
 
             (self.extra_task_handling_routine.clone())();
@@ -707,17 +708,18 @@ mod test {
     }
 
     fn init_framstream_unix(
-        source_name: &str,
+        source_id: &str,
         frame_handler: impl FrameHandler + Send + Sync + Clone + 'static,
-        pipeline: Pipeline,
+        pipeline: SourceSender,
     ) -> (
         PathBuf,
         JoinHandle<Result<(), ()>>,
         SourceShutdownCoordinator,
     ) {
+        let source_id = ComponentKey::from(source_id);
         let socket_path = frame_handler.socket_path();
         let mut shutdown = SourceShutdownCoordinator::default();
-        let (shutdown_signal, _) = shutdown.register_source(source_name);
+        let (shutdown_signal, _) = shutdown.register_source(&source_id);
         let server = build_framestream_unix_source(frame_handler, shutdown_signal, pipeline)
             .expect("Failed to build framestream unix source.");
 
@@ -799,7 +801,8 @@ mod test {
     async fn signal_shutdown(source_name: &str, shutdown: &mut SourceShutdownCoordinator) {
         // Now signal to the Source to shut down.
         let deadline = Instant::now() + Duration::from_secs(10);
-        let shutdown_complete = shutdown.shutdown_source(source_name, deadline);
+        let id = ComponentKey::from(source_name);
+        let shutdown_complete = shutdown.shutdown_source(&id, deadline);
         let shutdown_success = shutdown_complete.await;
         assert!(shutdown_success);
     }
@@ -807,7 +810,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn normal_framestream_singlethreaded() {
         let source_name = "test_source";
-        let (tx, rx) = Pipeline::new_test();
+        let (tx, rx) = SourceSender::new_test();
         let (path, source_handle, mut shutdown) =
             init_framstream_unix(source_name, create_frame_handler(false), tx);
         let (mut sock_sink, mut sock_stream) = make_unix_stream(path).await.split();
@@ -857,7 +860,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn normal_framestream_multithreaded() {
         let source_name = "test_source";
-        let (tx, rx) = Pipeline::new_test();
+        let (tx, rx) = SourceSender::new_test();
         let (path, source_handle, mut shutdown) =
             init_framstream_unix(source_name, create_frame_handler(true), tx);
         let (mut sock_sink, mut sock_stream) = make_unix_stream(path).await.split();
@@ -905,7 +908,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn multiple_content_types() {
         let source_name = "test_source";
-        let (tx, _) = Pipeline::new_test();
+        let (tx, _) = SourceSender::new_test();
         let (path, source_handle, mut shutdown) =
             init_framstream_unix(source_name, create_frame_handler(false), tx);
         let (mut sock_sink, mut sock_stream) = make_unix_stream(path).await.split();
@@ -935,7 +938,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn wrong_content_type() {
         let source_name = "test_source";
-        let (tx, _) = Pipeline::new_test();
+        let (tx, _) = SourceSender::new_test();
         let (path, source_handle, mut shutdown) =
             init_framstream_unix(source_name, create_frame_handler(false), tx);
         let (mut sock_sink, mut sock_stream) = make_unix_stream(path).await.split();
@@ -970,7 +973,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn data_too_soon() {
         let source_name = "test_source";
-        let (tx, rx) = Pipeline::new_test();
+        let (tx, rx) = SourceSender::new_test();
         let (path, source_handle, mut shutdown) =
             init_framstream_unix(source_name, create_frame_handler(false), tx);
         let (mut sock_sink, mut sock_stream) = make_unix_stream(path).await.split();
@@ -1028,7 +1031,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn unidirectional_framestream() {
         let source_name = "test_source";
-        let (tx, rx) = Pipeline::new_test();
+        let (tx, rx) = SourceSender::new_test();
         let (path, source_handle, mut shutdown) =
             init_framstream_unix(source_name, create_frame_handler(false), tx);
         let (mut sock_sink, _) = make_unix_stream(path).await.split();
@@ -1067,8 +1070,7 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_spawn_event_handling_tasks() {
-        let (tx, rx) = Pipeline::new_test();
-        let out = tx.sink_map_err(|e| error!("Error sending event: {:?}.", e));
+        let (out, rx) = SourceSender::new_test();
 
         let max_frame_handling_tasks = 20;
         let active_task_nums = Arc::new(AtomicU32::new(0));

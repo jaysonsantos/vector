@@ -1,3 +1,19 @@
+use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf};
+
+use futures::StreamExt;
+use once_cell::race::OnceNonZeroUsize;
+use tokio::{
+    runtime::{self, Runtime},
+    sync::mpsc,
+};
+use tokio_stream::wrappers::UnboundedReceiverStream;
+
+#[cfg(feature = "enterprise")]
+use crate::config::enterprise::PipelinesError;
+#[cfg(windows)]
+use crate::service;
+#[cfg(feature = "api")]
+use crate::{api, internal_events::ApiStarted};
 use crate::{
     cli::{handle_config_errors, Color, LogFormat, Opts, RootOpts, SubCommand},
     config, generate, graph, heartbeat, list, metrics,
@@ -5,27 +21,13 @@ use crate::{
     topology::{self, RunningTopology},
     trace, unit_test, validate,
 };
-use cfg_if::cfg_if;
-use futures::StreamExt;
-use std::{collections::HashMap, path::PathBuf};
-use tokio::{
-    runtime::{self, Runtime},
-    sync::mpsc,
-};
-use tokio_stream::wrappers::UnboundedReceiverStream;
-
 #[cfg(feature = "api-client")]
-use crate::tap;
-#[cfg(feature = "api-client")]
-use crate::top;
-#[cfg(feature = "api")]
-use crate::{api, internal_events::ApiStarted};
+use crate::{tap, top};
 
-#[cfg(windows)]
-use crate::service;
+pub static WORKER_THREADS: OnceNonZeroUsize = OnceNonZeroUsize::new();
 
 use crate::internal_events::{
-    VectorConfigLoadFailed, VectorQuit, VectorRecoveryFailed, VectorReloadFailed, VectorReloaded,
+    VectorConfigLoadError, VectorQuit, VectorRecoveryError, VectorReloadError, VectorReloaded,
     VectorStarted, VectorStopped,
 };
 
@@ -47,25 +49,37 @@ pub struct Application {
 
 impl Application {
     pub fn prepare() -> Result<Self, exitcode::ExitCode> {
-        let opts = Opts::get_matches();
+        let opts = Opts::get_matches().map_err(|error| {
+            // Printing to stdout/err can itself fail; ignore it.
+            let _ = error.print();
+            exitcode::USAGE
+        })?;
+
         Self::prepare_from_opts(opts)
     }
 
     pub fn prepare_from_opts(opts: Opts) -> Result<Self, exitcode::ExitCode> {
         openssl_probe::init_ssl_cert_env_vars();
 
-        let level = std::env::var("LOG").unwrap_or_else(|_| match opts.log_level() {
-            "off" => "off".to_owned(),
-            level => [
-                format!("vector={}", level),
-                format!("codec={}", level),
-                format!("vrl={}", level),
-                format!("file_source={}", level),
-                "tower_limit=trace".to_owned(),
-                format!("rdkafka={}", level),
-            ]
-            .join(","),
-        });
+        let level = std::env::var("VECTOR_LOG")
+            .or_else(|_| {
+                warn!(message = "Use of $LOG is deprecated. Please use $VECTOR_LOG instead.");
+                std::env::var("LOG")
+            })
+            .unwrap_or_else(|_| match opts.log_level() {
+                "off" => "off".to_owned(),
+                level => [
+                    format!("vector={}", level),
+                    format!("codec={}", level),
+                    format!("vrl={}", level),
+                    format!("file_source={}", level),
+                    "tower_limit=trace".to_owned(),
+                    format!("rdkafka={}", level),
+                    format!("buffers={}", level),
+                    format!("kube={}", level),
+                ]
+                .join(","),
+            });
 
         let root_opts = opts.root;
 
@@ -85,36 +99,24 @@ impl Application {
             LogFormat::Json => true,
         };
 
-        let enable_datadog_tracing = root_opts.enable_datadog_tracing;
+        metrics::init_global().expect("metrics initialization failed");
 
-        metrics::init().expect("metrics initialization failed");
+        let mut rt_builder = runtime::Builder::new_multi_thread();
+        rt_builder.enable_all().thread_name("vector-worker");
 
         if let Some(threads) = root_opts.threads {
             if threads < 1 {
-                // Unforunately we can't `error!` here because we haven't yet called `trace::init`,
-                // and we can't call that without a runtime available.
-                println!("Config error: The `threads` argument must be greater or equal to 1.");
+                error!("The `threads` argument must be greater or equal to 1.");
                 return Err(exitcode::CONFIG);
+            } else {
+                WORKER_THREADS
+                    .set(NonZeroUsize::new(threads).expect("already checked"))
+                    .expect("double thread initialization");
+                rt_builder.worker_threads(threads);
             }
         }
 
-        let rt = {
-            runtime::Builder::new_multi_thread()
-                .enable_all()
-                .thread_name("vector-worker")
-                .build()
-                .expect("Unable to create async runtime")
-        };
-
-        // We need a runtime to initiate the datadog tracing exporter
-        rt.block_on(async move {
-            trace::init(color, json, &level, enable_datadog_tracing);
-            info!(
-                message = "Log level is enabled.",
-                ?level,
-                ?enable_datadog_tracing
-            );
-        });
+        let rt = rt_builder.build().expect("Unable to create async runtime");
 
         let config = {
             let config_paths = root_opts.config_paths_with_formats();
@@ -122,6 +124,7 @@ impl Application {
             let require_healthy = root_opts.require_healthy;
 
             rt.block_on(async move {
+                trace::init(color, json, &level);
                 // Signal handler for OS and provider messages.
                 let (mut signal_handler, signal_rx) = signal::SignalHandler::new();
                 signal_handler.forever(signal::os_signals());
@@ -130,6 +133,7 @@ impl Application {
                     let code = match s {
                         SubCommand::Generate(g) => generate::cmd(&g),
                         SubCommand::Graph(g) => graph::cmd(&g),
+                        SubCommand::Config(c) => config::cmd(&c),
                         SubCommand::List(l) => list::cmd(&l),
                         SubCommand::Test(t) => unit_test::cmd(&t).await,
                         #[cfg(windows)]
@@ -137,7 +141,8 @@ impl Application {
                         #[cfg(feature = "api-client")]
                         SubCommand::Top(t) => top::cmd(&t).await,
                         #[cfg(feature = "api-client")]
-                        SubCommand::Tap(t) => tap::cmd(&t).await,
+                        SubCommand::Tap(t) => tap::cmd(&t, signal_rx).await,
+
                         SubCommand::Validate(v) => validate::validate(&v, color).await,
                         #[cfg(feature = "vrl-cli")]
                         SubCommand::Vrl(s) => vrl_cli::cmd::cmd(&s),
@@ -145,6 +150,8 @@ impl Application {
 
                     return Err(code);
                 };
+
+                info!(message = "Log level is enabled.", level = ?level);
 
                 let config_paths = config::process_paths(&config_paths).ok_or(exitcode::CONFIG)?;
 
@@ -173,6 +180,19 @@ impl Application {
                     info!("Health checks are disabled.");
                 }
                 config.healthchecks.set_require_healthy(require_healthy);
+
+                #[cfg(feature = "enterprise")]
+                // Augment config to enable observability within Datadog, if applicable.
+                if let Err(PipelinesError::FatalCouldNotReportConfig) =
+                    config::enterprise::try_attach(
+                        &mut config,
+                        &config_paths,
+                        signal_handler.subscribe(),
+                    )
+                    .await
+                {
+                    return Err(exitcode::UNAVAILABLE);
+                }
 
                 let diff = config::ConfigDiff::initial(&config);
                 let pieces = topology::build_or_log_errors(&config, &diff, HashMap::new())
@@ -229,33 +249,39 @@ impl Application {
             tokio::spawn(heartbeat::heartbeat());
 
             // Configure the API server, if applicable.
-            cfg_if! (
-                if #[cfg(feature = "api")] {
-                    // Assigned to prevent the API terminating when falling out of scope.
-                    let api_server = if api_config.enabled {
-                        emit!(ApiStarted {
-                            addr: api_config.address.unwrap(),
-                            playground: api_config.playground
-                        });
+            #[cfg(feature = "api")]
+            // Assigned to prevent the API terminating when falling out of scope.
+            let api_server = if api_config.enabled {
+                use std::sync::{Arc, atomic::AtomicBool};
+                emit!(ApiStarted {
+                    addr: api_config.address.unwrap(),
+                    playground: api_config.playground
+                });
 
-                        Some(api::Server::start(topology.config(), topology.watch()))
-                    } else {
-                        info!(message="API is disabled, enable by setting `api.enabled` to `true` and use commands like `vector top`.");
-                        None
-                    };
-                }
-            );
+                Some(api::Server::start(topology.config(), topology.watch(), Arc::<AtomicBool>::clone(&topology.running)))
+            } else {
+                info!(message="API is disabled, enable by setting `api.enabled` to `true` and use commands like `vector top`.");
+                None
+            };
 
             let mut sources_finished = topology.sources_finished();
 
             let signal = loop {
                 tokio::select! {
-                    Some(signal) = signal_rx.recv() => {
+                    Ok(signal) = signal_rx.recv() => {
                         match signal {
                             SignalTo::ReloadFromConfigBuilder(config_builder) => {
                                 match config_builder.build().map_err(handle_config_errors) {
                                     Ok(mut new_config) => {
                                         new_config.healthchecks.set_require_healthy(opts.require_healthy);
+
+                                        #[cfg(feature = "enterprise")]
+                                        if let Err(PipelinesError::FatalCouldNotReportConfig) =
+                                            config::enterprise::try_attach(&mut new_config, &config_paths, signal_handler.subscribe()).await
+                                        {
+                                            break SignalTo::Shutdown;
+                                        }
+
                                         match topology
                                             .reload_config_and_respawn(new_config)
                                             .await
@@ -269,24 +295,25 @@ impl Application {
 
                                                 emit!(VectorReloaded { config_paths: &config_paths })
                                             },
-                                            Ok(false) => emit!(VectorReloadFailed),
+                                            Ok(false) => emit!(VectorReloadError),
                                             // Trigger graceful shutdown for what remains of the topology
                                             Err(()) => {
-                                                emit!(VectorReloadFailed);
-                                                emit!(VectorRecoveryFailed);
+                                                emit!(VectorReloadError);
+                                                emit!(VectorRecoveryError);
                                                 break SignalTo::Shutdown;
                                             }
                                         }
                                         sources_finished = topology.sources_finished();
                                     },
                                     Err(_) => {
-                                        emit!(VectorConfigLoadFailed);
+                                        emit!(VectorConfigLoadError);
                                     }
                                 }
                             }
                             SignalTo::ReloadFromDisk => {
                                 // Reload paths
                                 config_paths = config::process_paths(&opts.config_paths_with_formats()).unwrap_or(config_paths);
+
                                 // Reload config
                                 let new_config = config::load_from_paths_with_provider(&config_paths, &mut signal_handler)
                                     .await
@@ -294,6 +321,15 @@ impl Application {
 
                                 if let Some(mut new_config) = new_config {
                                     new_config.healthchecks.set_require_healthy(opts.require_healthy);
+
+                                    #[cfg(feature = "enterprise")]
+                                    // Augment config to enable observability within Datadog, if applicable.
+                                    if let Err(PipelinesError::FatalCouldNotReportConfig) =
+                                        config::enterprise::try_attach(&mut new_config, &config_paths, signal_handler.subscribe()).await
+                                    {
+                                        break SignalTo::Shutdown;
+                                    }
+
                                     match topology
                                         .reload_config_and_respawn(new_config)
                                         .await
@@ -307,17 +343,17 @@ impl Application {
 
                                             emit!(VectorReloaded { config_paths: &config_paths })
                                         },
-                                        Ok(false) => emit!(VectorReloadFailed),
+                                        Ok(false) => emit!(VectorReloadError),
                                         // Trigger graceful shutdown for what remains of the topology
                                         Err(()) => {
-                                            emit!(VectorReloadFailed);
-                                            emit!(VectorRecoveryFailed);
+                                            emit!(VectorReloadError);
+                                            emit!(VectorRecoveryError);
                                             break SignalTo::Shutdown;
                                         }
                                     }
                                     sources_finished = topology.sources_finished();
                                 } else {
-                                    emit!(VectorConfigLoadFailed);
+                                    emit!(VectorConfigLoadError);
                                 }
                             }
                             _ => break signal,
@@ -349,8 +385,6 @@ impl Application {
                 }
                 _ => unreachable!(),
             }
-
-            opentelemetry::global::shutdown_tracer_provider();
         });
     }
 }

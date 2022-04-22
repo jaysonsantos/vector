@@ -1,31 +1,7 @@
 use indoc::indoc;
 use k8s_e2e_tests::*;
-use k8s_openapi::{api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::ObjectMeta};
 use k8s_test_framework::{lock, namespace, test_pod, vector::Config as VectorConfig};
 use serde_json::Value;
-
-const HELM_CHART_VECTOR_AGGREGATOR: &str = "vector-aggregator";
-
-const HELM_VALUES_DDOG_AGG_TOPOLOGY: &str = indoc! {r#"
-    service:
-      type: ClusterIP
-      ports:
-        - name: datadog
-          port: 8080
-          protocol: TCP
-          targetPort: 8080
-    sources:
-      datadog-agent:
-        type: datadog_agent
-        address: 0.0.0.0:8080
-
-    sinks:
-      stdout:
-        type: console
-        inputs: ["datadog-agent"]
-        target: stdout
-        encoding: json
-"#};
 
 /// This test validates that vector-aggregator can deploy with the default
 /// settings and a dummy topology.
@@ -40,7 +16,7 @@ async fn datadog_to_vector() -> Result<(), Box<dyn std::error::Error>> {
     let pod_namespace = get_namespace_appended(&namespace, "test-pod");
     let framework = make_framework();
 
-    // Value.yaml for datadog offical chart
+    // Value.yaml for datadog official chart
     let datadog_chart_values = &format!(
         indoc! {r#"
         datadog:
@@ -63,7 +39,7 @@ async fn datadog_to_vector() -> Result<(), Box<dyn std::error::Error>> {
             kubelet_tls_verify: false
             logs_config.use_http: true
             logs_config.logs_no_ssl: true
-            logs_config.logs_dd_url: {}:8080
+            logs_config.logs_dd_url: {}:8282
             listeners:
               - name: kubelet
             config_providers:
@@ -76,14 +52,13 @@ async fn datadog_to_vector() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let _vector = framework
-        .vector(
+        .helm_chart(
             &namespace,
-            HELM_CHART_VECTOR_AGGREGATOR,
+            "vector",
+            "vector",
+            "https://helm.vector.dev",
             VectorConfig {
-                custom_helm_values: vec![
-                    &config_override_name(&override_name, false),
-                    HELM_VALUES_DDOG_AGG_TOPOLOGY,
-                ],
+                custom_helm_values: vec![&config_override_name(&override_name, false)],
                 ..Default::default()
             },
         )
@@ -97,8 +72,9 @@ async fn datadog_to_vector() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let _datadog_agent = framework
-        .external_chart(
+        .helm_chart(
             &datadog_namespace,
+            "datadog",
             "datadog",
             "https://helm.datadoghq.com",
             // VectorConfig is a generic config container

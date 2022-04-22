@@ -1,18 +1,21 @@
-use crate::{
-    conditions::{AnyCondition, Condition},
-    config::{DataType, GlobalOptions, TransformConfig, TransformDescription},
-    event::{discriminant::Discriminant, Event, EventMetadata, LogEvent},
-    internal_events::ReduceStaleEventFlushed,
-    transforms::{TaskTransform, Transform},
-};
-use async_stream::stream;
-use futures::{stream, Stream, StreamExt};
-use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map, HashMap},
     pin::Pin,
     time::{Duration, Instant},
+};
+
+use async_stream::stream;
+use futures::{stream, Stream, StreamExt};
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    conditions::{AnyCondition, Condition},
+    config::{DataType, Input, Output, TransformConfig, TransformContext, TransformDescription},
+    event::{discriminant::Discriminant, Event, EventMetadata, LogEvent},
+    internal_events::ReduceStaleEventFlushed,
+    schema,
+    transforms::{TaskTransform, Transform},
 };
 
 mod merge_strategy;
@@ -51,16 +54,16 @@ impl_generate_config_from_default!(ReduceConfig);
 #[async_trait::async_trait]
 #[typetag::serde(name = "reduce")]
 impl TransformConfig for ReduceConfig {
-    async fn build(&self, _globals: &GlobalOptions) -> crate::Result<Transform> {
-        Reduce::new(self).map(Transform::task)
+    async fn build(&self, context: &TransformContext) -> crate::Result<Transform> {
+        Reduce::new(self, &context.enrichment_tables).map(Transform::event_task)
     }
 
-    fn input_type(&self) -> DataType {
-        DataType::Log
+    fn input(&self) -> Input {
+        Input::log()
     }
 
-    fn output_type(&self) -> DataType {
-        DataType::Log
+    fn outputs(&self, _: &schema::Definition) -> Vec<Output> {
+        vec![Output::default(DataType::Log)]
     }
 
     fn transform_type(&self) -> &'static str {
@@ -150,18 +153,29 @@ pub struct Reduce {
     group_by: Vec<String>,
     merge_strategies: IndexMap<String, MergeStrategy>,
     reduce_merge_states: HashMap<Discriminant, ReduceState>,
-    ends_when: Option<Box<dyn Condition>>,
-    starts_when: Option<Box<dyn Condition>>,
+    ends_when: Option<Condition>,
+    starts_when: Option<Condition>,
 }
 
 impl Reduce {
-    pub fn new(config: &ReduceConfig) -> crate::Result<Self> {
+    pub fn new(
+        config: &ReduceConfig,
+        enrichment_tables: &enrichment::TableRegistry,
+    ) -> crate::Result<Self> {
         if config.ends_when.is_some() && config.starts_when.is_some() {
             return Err("only one of `ends_when` and `starts_when` can be provided".into());
         }
 
-        let ends_when = config.ends_when.as_ref().map(|c| c.build()).transpose()?;
-        let starts_when = config.starts_when.as_ref().map(|c| c.build()).transpose()?;
+        let ends_when = config
+            .ends_when
+            .as_ref()
+            .map(|c| c.build(enrichment_tables))
+            .transpose()?;
+        let starts_when = config
+            .starts_when
+            .as_ref()
+            .map(|c| c.build(enrichment_tables))
+            .transpose()?;
         let group_by = config.group_by.clone().into_iter().collect();
 
         Ok(Reduce {
@@ -246,7 +260,7 @@ impl Reduce {
     }
 }
 
-impl TaskTransform for Reduce {
+impl TaskTransform<Event> for Reduce {
     fn transform(
         self: Box<Self>,
         mut input_rx: Pin<Box<dyn Stream<Item = Event> + Send>>,
@@ -293,12 +307,13 @@ impl TaskTransform for Reduce {
 
 #[cfg(test)]
 mod test {
+    use serde_json::json;
+
     use super::*;
     use crate::{
         config::TransformConfig,
         event::{LogEvent, Value},
     };
-    use serde_json::json;
 
     #[test]
     fn generate_config() {
@@ -317,7 +332,7 @@ group_by = [ "request_id" ]
 "#,
         )
         .unwrap()
-        .build(&GlobalOptions::default())
+        .build(&TransformContext::default())
         .await
         .unwrap();
         let reduce = reduce.into_task();
@@ -349,7 +364,7 @@ group_by = [ "request_id" ]
 
         let inputs = vec![e_1.into(), e_2.into(), e_3.into(), e_4.into(), e_5.into()];
         let in_stream = Box::pin(stream::iter(inputs));
-        let mut out_stream = reduce.transform(in_stream);
+        let mut out_stream = reduce.transform_events(in_stream);
 
         let output_1 = out_stream.next().await.unwrap().into_log();
         assert_eq!(output_1["message"], "test message 1".into());
@@ -379,7 +394,7 @@ merge_strategies.baz = "max"
 "#,
         )
         .unwrap()
-        .build(&GlobalOptions::default())
+        .build(&TransformContext::default())
         .await
         .unwrap();
         let reduce = reduce.into_task();
@@ -406,7 +421,7 @@ merge_strategies.baz = "max"
 
         let inputs = vec![e_1.into(), e_2.into(), e_3.into()];
         let in_stream = Box::pin(stream::iter(inputs));
-        let mut out_stream = reduce.transform(in_stream);
+        let mut out_stream = reduce.transform_events(in_stream);
 
         let output_1 = out_stream.next().await.unwrap().into_log();
         assert_eq!(output_1["message"], "test message 1".into());
@@ -431,7 +446,7 @@ group_by = [ "request_id" ]
 "#,
         )
         .unwrap()
-        .build(&GlobalOptions::default())
+        .build(&TransformContext::default())
         .await
         .unwrap();
         let reduce = reduce.into_task();
@@ -461,7 +476,7 @@ group_by = [ "request_id" ]
 
         let inputs = vec![e_1.into(), e_2.into(), e_3.into(), e_4.into(), e_5.into()];
         let in_stream = Box::pin(stream::iter(inputs));
-        let mut out_stream = reduce.transform(in_stream);
+        let mut out_stream = reduce.transform_events(in_stream);
 
         let output_1 = out_stream.next().await.unwrap().into_log();
         assert_eq!(output_1["message"], "test message 1".into());
@@ -490,7 +505,7 @@ merge_strategies.bar = "concat"
 "#,
         )
         .unwrap()
-        .build(&GlobalOptions::default())
+        .build(&TransformContext::default())
         .await
         .unwrap();
         let reduce = reduce.into_task();
@@ -538,7 +553,7 @@ merge_strategies.bar = "concat"
             e_6.into(),
         ];
         let in_stream = Box::pin(stream::iter(inputs));
-        let mut out_stream = reduce.transform(in_stream);
+        let mut out_stream = reduce.transform_events(in_stream);
 
         let output_1 = out_stream.next().await.unwrap().into_log();
         assert_eq!(output_1["foo"], json!([[1, 3], [5, 7], "done"]).into());

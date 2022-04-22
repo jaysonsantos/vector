@@ -1,38 +1,49 @@
+use bytes::Bytes;
+use codecs::{
+    decoding::{self, Deserializer, Framer},
+    LengthDelimitedDecoder,
+};
+use prost::Message;
+use serde::{Deserialize, Serialize};
+use smallvec::{smallvec, SmallVec};
+
 use crate::{
-    config::{DataType, GenerateConfig, Resource, SourceContext},
+    codecs::Decoder,
+    config::{DataType, GenerateConfig, Output, Resource, SourceContext},
     event::{proto, Event},
     internal_events::{VectorEventReceived, VectorProtoDecodeError},
     sources::{
-        util::{SocketListenAddr, TcpSource},
+        util::{SocketListenAddr, TcpNullAcker, TcpSource},
         Source,
     },
     tcp::TcpKeepaliveConfig,
     tls::{MaybeTlsSettings, TlsConfig},
 };
-use bytes::{Bytes, BytesMut};
-use getset::Setters;
-use prost::Message;
-use serde::{Deserialize, Serialize};
-use tokio_util::codec::LengthDelimitedCodec;
 
-#[derive(Deserialize, Serialize, Debug, Clone, Setters)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct VectorConfig {
+pub(crate) struct VectorConfig {
     address: SocketListenAddr,
     keepalive: Option<TcpKeepaliveConfig>,
     #[serde(default = "default_shutdown_timeout_secs")]
     shutdown_timeout_secs: u64,
-    #[set = "pub"]
     tls: Option<TlsConfig>,
     receive_buffer_bytes: Option<usize>,
 }
 
-fn default_shutdown_timeout_secs() -> u64 {
+const fn default_shutdown_timeout_secs() -> u64 {
     30
 }
 
 impl VectorConfig {
-    pub fn from_address(address: SocketListenAddr) -> Self {
+    #[cfg(test)]
+    #[allow(unused)] // this test function is not always used in test, breaking
+                     // our cargo-hack run
+    pub fn set_tls(&mut self, config: Option<TlsConfig>) {
+        self.tls = config;
+    }
+
+    pub const fn from_address(address: SocketListenAddr) -> Self {
         Self {
             address,
             keepalive: None,
@@ -62,16 +73,17 @@ impl VectorConfig {
             self.shutdown_timeout_secs,
             tls,
             self.receive_buffer_bytes,
-            cx.shutdown,
-            cx.out,
+            cx,
+            false.into(),
+            None,
         )
     }
 
-    pub(super) fn output_type(&self) -> DataType {
-        DataType::Any
+    pub(super) fn outputs(&self) -> Vec<Output> {
+        vec![Output::default(DataType::all())]
     }
 
-    pub(super) fn source_type(&self) -> &'static str {
+    pub(super) const fn source_type(&self) -> &'static str {
         "vector"
     }
 
@@ -81,57 +93,56 @@ impl VectorConfig {
 }
 
 #[derive(Debug, Clone)]
+struct VectorDeserializer;
+
+impl decoding::format::Deserializer for VectorDeserializer {
+    fn parse(&self, bytes: Bytes) -> crate::Result<SmallVec<[Event; 1]>> {
+        let byte_size = bytes.len();
+        match proto::EventWrapper::decode(bytes).map(Event::from) {
+            Ok(event) => {
+                emit!(VectorEventReceived { byte_size });
+                Ok(smallvec![event])
+            }
+            Err(error) => {
+                emit!(VectorProtoDecodeError { error: &error });
+                Err(Box::new(error))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct VectorSource;
 
 impl TcpSource for VectorSource {
-    type Error = std::io::Error;
-    type Decoder = LengthDelimitedCodec;
+    type Error = decoding::Error;
+    type Item = SmallVec<[Event; 1]>;
+    type Decoder = Decoder;
+    type Acker = TcpNullAcker;
 
     fn decoder(&self) -> Self::Decoder {
-        LengthDelimitedCodec::new()
+        Decoder::new(
+            Framer::LengthDelimited(LengthDelimitedDecoder::new()),
+            Deserializer::Boxed(Box::new(VectorDeserializer)),
+        )
     }
 
-    fn build_event(&self, frame: BytesMut, _host: Bytes) -> Option<Event> {
-        let byte_size = frame.len();
-        match proto::EventWrapper::decode(frame).map(Event::from) {
-            Ok(event) => {
-                emit!(VectorEventReceived { byte_size });
-                Some(event)
-            }
-            Err(error) => {
-                emit!(VectorProtoDecodeError { error });
-                None
-            }
-        }
+    fn build_acker(&self, _: &[Self::Item]) -> Self::Acker {
+        TcpNullAcker
     }
 }
 
 #[cfg(feature = "sinks-vector")]
 #[cfg(test)]
 mod test {
-    use super::VectorConfig;
-    use crate::shutdown::ShutdownSignal;
-    use crate::{
-        config::{GlobalOptions, SinkContext, SourceContext},
-        event::Event,
-        event::{
-            metric::{MetricKind, MetricValue},
-            Metric,
-        },
-        sinks::vector::v1::VectorConfig as SinkConfig,
-        test_util::{collect_ready, next_addr, trace_init, wait_for_tcp},
-        tls::{TlsConfig, TlsOptions},
-        Pipeline,
-    };
-    use futures::stream;
-    use shared::assert_event_data_eq;
-    use std::net::SocketAddr;
+    use std::{collections::HashMap, net::SocketAddr};
+
     use tokio::{
         io::AsyncWriteExt,
         net::TcpStream,
         time::{sleep, Duration},
     };
-
+    use vector_common::assert_event_data_eq;
     #[cfg(not(target_os = "windows"))]
     use {
         crate::event::proto,
@@ -141,15 +152,32 @@ mod test {
         tokio_util::codec::{FramedWrite, LengthDelimitedCodec},
     };
 
+    use super::VectorConfig;
+    use crate::{
+        config::{ComponentKey, GlobalOptions, SinkContext, SourceContext},
+        event::{
+            metric::{MetricKind, MetricValue},
+            Event, Metric,
+        },
+        shutdown::ShutdownSignal,
+        sinks::vector::v1::VectorConfig as SinkConfig,
+        test_util::{collect_ready, next_addr, trace_init, wait_for_tcp},
+        tls::{TlsConfig, TlsOptions},
+        SourceSender,
+    };
+
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<VectorConfig>();
     }
 
     async fn stream_test(addr: SocketAddr, source: VectorConfig, sink: SinkConfig) {
-        let (tx, rx) = Pipeline::new_test();
+        let (tx, rx) = SourceSender::new_test();
 
-        let server = source.build(SourceContext::new_test(tx)).await.unwrap();
+        let server = source
+            .build(SourceContext::new_test(tx, None))
+            .await
+            .unwrap();
         tokio::spawn(server);
         wait_for_tcp(addr).await;
 
@@ -172,7 +200,7 @@ mod test {
             )),
         ];
 
-        sink.run(stream::iter(events.clone())).await.unwrap();
+        sink.run_events(events.clone()).await.unwrap();
 
         sleep(Duration::from_millis(50)).await;
 
@@ -219,7 +247,7 @@ mod test {
     #[tokio::test]
     async fn it_closes_stream_on_garbage_data() {
         trace_init();
-        let (tx, rx) = Pipeline::new_test();
+        let (tx, rx) = SourceSender::new_test();
         let addr = next_addr();
 
         let config = VectorConfig::from_address(addr.into());
@@ -228,12 +256,13 @@ mod test {
 
         let server = config
             .build(SourceContext {
-                name: "default".into(),
+                key: ComponentKey::from("default"),
                 globals: GlobalOptions::default(),
                 shutdown,
                 out: tx,
-                acknowledgements: true,
                 proxy: Default::default(),
+                acknowledgements: false,
+                schema_definitions: HashMap::default(),
             })
             .await
             .unwrap();
@@ -257,7 +286,7 @@ mod test {
     #[cfg(not(target_os = "windows"))]
     async fn it_processes_stream_of_protobufs() {
         trace_init();
-        let (tx, rx) = Pipeline::new_test();
+        let (tx, rx) = SourceSender::new_test();
         let addr = next_addr();
 
         let config = VectorConfig::from_address(addr.into());
@@ -266,12 +295,13 @@ mod test {
 
         let server = config
             .build(SourceContext {
-                name: "default".into(),
+                key: ComponentKey::from("default"),
                 globals: GlobalOptions::default(),
                 shutdown,
                 out: tx,
-                acknowledgements: true,
                 proxy: Default::default(),
+                acknowledgements: false,
+                schema_definitions: HashMap::default(),
             })
             .await
             .unwrap();

@@ -1,16 +1,20 @@
-use crate::{
-    config::{
-        log_schema, DataType, GenerateConfig, GlobalOptions, TransformConfig, TransformDescription,
-    },
-    event::{Event, Value},
-    internal_events::DedupeEventDiscarded,
-    transforms::{TaskTransform, Transform},
-};
+use std::{future::ready, pin::Pin};
+
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use std::{future::ready, pin::Pin};
+
+use crate::{
+    config::{
+        log_schema, DataType, GenerateConfig, Input, Output, TransformConfig, TransformContext,
+        TransformDescription,
+    },
+    event::{Event, Value},
+    internal_events::DedupeEventDiscarded,
+    schema,
+    transforms::{TaskTransform, Transform},
+};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -36,7 +40,7 @@ pub struct DedupeConfig {
     pub cache: CacheConfig,
 }
 
-fn default_cache_config() -> CacheConfig {
+const fn default_cache_config() -> CacheConfig {
     CacheConfig { num_events: 5000 }
 }
 
@@ -79,16 +83,16 @@ impl GenerateConfig for DedupeConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "dedupe")]
 impl TransformConfig for DedupeConfig {
-    async fn build(&self, _globals: &GlobalOptions) -> crate::Result<Transform> {
-        Ok(Transform::task(Dedupe::new(self.clone())))
+    async fn build(&self, _context: &TransformContext) -> crate::Result<Transform> {
+        Ok(Transform::event_task(Dedupe::new(self.clone())))
     }
 
-    fn input_type(&self) -> DataType {
-        DataType::Log
+    fn input(&self) -> Input {
+        Input::log()
     }
 
-    fn output_type(&self) -> DataType {
-        DataType::Log
+    fn outputs(&self, _: &schema::Definition) -> Vec<Output> {
+        vec![Output::default(DataType::Log)]
     }
 
     fn transform_type(&self) -> &'static str {
@@ -128,16 +132,17 @@ enum CacheEntry {
 }
 
 /// Assigns a unique number to each of the types supported by Event::Value.
-fn type_id_for_value(val: &Value) -> TypeId {
+const fn type_id_for_value(val: &Value) -> TypeId {
     match val {
         Value::Bytes(_) => 0,
         Value::Timestamp(_) => 1,
         Value::Integer(_) => 2,
         Value::Float(_) => 3,
         Value::Boolean(_) => 4,
-        Value::Map(_) => 5,
+        Value::Object(_) => 5,
         Value::Array(_) => 6,
         Value::Null => 7,
+        Value::Regex(_) => 8,
     }
 }
 
@@ -170,8 +175,8 @@ fn build_cache_entry(event: &Event, fields: &FieldMatchConfig) -> CacheEntry {
         FieldMatchConfig::MatchFields(fields) => {
             let mut entry = Vec::new();
             for field_name in fields.iter() {
-                if let Some(value) = event.as_log().get(&field_name) {
-                    entry.push(Some((type_id_for_value(value), value.as_bytes())));
+                if let Some(value) = event.as_log().get(field_name.as_str()) {
+                    entry.push(Some((type_id_for_value(value), value.coerce_to_bytes())));
                 } else {
                     entry.push(None);
                 }
@@ -183,7 +188,11 @@ fn build_cache_entry(event: &Event, fields: &FieldMatchConfig) -> CacheEntry {
 
             for (field_name, value) in event.as_log().all_fields() {
                 if !fields.contains(&field_name) {
-                    entry.push((field_name, type_id_for_value(value), value.as_bytes()));
+                    entry.push((
+                        field_name,
+                        type_id_for_value(value),
+                        value.coerce_to_bytes(),
+                    ));
                 }
             }
 
@@ -192,7 +201,7 @@ fn build_cache_entry(event: &Event, fields: &FieldMatchConfig) -> CacheEntry {
     }
 }
 
-impl TaskTransform for Dedupe {
+impl TaskTransform<Event> for Dedupe {
     fn transform(
         self: Box<Self>,
         task: Pin<Box<dyn Stream<Item = Event> + Send>>,
@@ -207,10 +216,13 @@ impl TaskTransform for Dedupe {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::transforms::dedupe::{CacheConfig, DedupeConfig, FieldMatchConfig};
-    use crate::{event::Event, event::Value};
     use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::{
+        event::{Event, Value},
+        transforms::dedupe::{CacheConfig, DedupeConfig, FieldMatchConfig},
+    };
 
     #[test]
     fn generate_config() {

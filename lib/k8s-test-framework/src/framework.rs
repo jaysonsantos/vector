@@ -19,37 +19,21 @@ impl Framework {
         Self { interface }
     }
 
-    /// Deploy `vector` into a cluster.
-    pub async fn vector(
+    /// Deploy a Helm chart into a cluster.
+    pub async fn helm_chart(
         &self,
         namespace: &str,
         helm_chart: &str,
-        config: vector::Config<'_>,
-    ) -> Result<up_down::Manager<vector::CommandBuilder>> {
-        let mut manager = vector::manager(
-            self.interface.deploy_vector_command.as_str(),
-            namespace,
-            helm_chart,
-            config,
-            None,
-        )?;
-        manager.up().await?;
-        Ok(manager)
-    }
-
-    /// Deploy an external chart into a cluster.
-    pub async fn external_chart(
-        &self,
-        namespace: &str,
-        helm_chart: &str,
+        release_name: &str,
         helm_repo: &str,
         config: vector::Config<'_>,
     ) -> Result<up_down::Manager<vector::CommandBuilder>> {
         let env = vec![("CHART_REPO".to_owned(), helm_repo.to_owned())];
         let mut manager = vector::manager(
-            self.interface.deploy_generic_chart_command.as_str(),
+            self.interface.deploy_chart_command.as_str(),
             namespace,
             helm_chart,
+            release_name,
             config,
             Some(env),
         )?;

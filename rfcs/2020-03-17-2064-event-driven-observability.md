@@ -232,7 +232,7 @@ I believe our goal here should be something like the following:
 
 1. Settle on a set of well-known pieces of context that we ensure are set
    uniformly on spans at the topology-building layer (e.g. `component_kind`,
-   `component_type`, `component_name`).
+   `component_type`, `component_id`).
 
 2. Rely on the existing `tracing` implementation to output that context in logs.
 
@@ -270,6 +270,6 @@ Metrics context work:
 * [ ] Coordinate with `metrics` maintainers to determine best path forward for
   context data (see [relevant issue][2])
 
-[0]: https://github.com/timberio/vector/blob/8140c2b6b04509ffc669aeefbf3c2a07c1b246d1/src/sources/file/mod.rs#L285-L291
+[0]: https://github.com/vectordotdev/vector/blob/8140c2b6b04509ffc669aeefbf3c2a07c1b246d1/src/sources/file/mod.rs#L285-L291
 [1]: https://xaeroxe.github.io/init-struct-pattern/
 [2]: https://github.com/metrics-rs/metrics/issues/67

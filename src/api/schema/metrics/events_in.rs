@@ -1,11 +1,12 @@
-use crate::event::{Metric, MetricValue};
 use async_graphql::Object;
 use chrono::{DateTime, Utc};
+
+use crate::event::{Metric, MetricValue};
 
 pub struct EventsInTotal(Metric);
 
 impl EventsInTotal {
-    pub fn new(m: Metric) -> Self {
+    pub const fn new(m: Metric) -> Self {
         Self(m)
     }
 
@@ -37,60 +38,5 @@ impl EventsInTotal {
 impl From<Metric> for EventsInTotal {
     fn from(m: Metric) -> Self {
         Self(m)
-    }
-}
-
-pub struct ComponentEventsInTotal {
-    name: String,
-    metric: Metric,
-}
-
-impl ComponentEventsInTotal {
-    /// Returns a new `ComponentEventsInTotal` struct, which is a GraphQL type. The
-    /// component name is hoisted for clear field resolution in the resulting payload.
-    pub fn new(metric: Metric) -> Self {
-        let name = metric.tag_value("component_name").expect(
-            "Returned a metric without a `component_name`, which shouldn't happen. Please report.",
-        );
-
-        Self { name, metric }
-    }
-}
-
-#[Object]
-impl ComponentEventsInTotal {
-    /// Component name
-    async fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Total incoming events metric
-    async fn metric(&self) -> EventsInTotal {
-        EventsInTotal::new(self.metric.clone())
-    }
-}
-
-pub struct ComponentEventsInThroughput {
-    name: String,
-    throughput: i64,
-}
-
-impl ComponentEventsInThroughput {
-    /// Returns a new `ComponentEventsInThroughput`, set to the provided name/throughput values.
-    pub fn new(name: String, throughput: i64) -> Self {
-        Self { name, throughput }
-    }
-}
-
-#[Object]
-impl ComponentEventsInThroughput {
-    /// Component name
-    async fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Events processed throughput
-    async fn throughput(&self) -> i64 {
-        self.throughput
     }
 }

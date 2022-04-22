@@ -1,49 +1,57 @@
-use crate::{
-    buffers::Acker,
-    conditions,
-    event::Metric,
-    shutdown::ShutdownSignal,
-    sinks::{self, util::UriSerde},
-    sources, transforms, Pipeline,
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::{self, Display, Formatter},
+    hash::Hash,
+    net::SocketAddr,
+    path::PathBuf,
 };
+
 use async_trait::async_trait;
 use component::ComponentDescription;
 use indexmap::IndexMap; // IndexMap preserves insertion order, allowing us to output errors in the same order they are present in the file
 use serde::{Deserialize, Serialize};
-use shared::TimeZone;
-use snafu::{ResultExt, Snafu};
-use std::collections::{HashMap, HashSet};
-use std::fmt::{self, Display, Formatter};
-use std::fs::DirBuilder;
-use std::hash::Hash;
-use std::net::SocketAddr;
-use std::path::PathBuf;
+pub use vector_core::config::{AcknowledgementsConfig, DataType, GlobalOptions, Input, Output};
+pub use vector_core::transform::{ExpandType, TransformConfig, TransformContext};
+
+use crate::{conditions, event::Metric, serde::OneOrMany};
 
 pub mod api;
 mod builder;
+mod cmd;
 mod compiler;
 pub mod component;
 mod diff;
+#[cfg(feature = "enterprise")]
+pub mod enterprise;
 pub mod format;
+mod graph;
+mod id;
 mod loading;
 pub mod provider;
-pub mod proxy;
+mod schema;
+mod sink;
+mod source;
+mod transform;
 mod unit_test;
 mod validation;
 mod vars;
 pub mod watcher;
 
 pub use builder::ConfigBuilder;
+pub use cmd::{cmd, Opts};
 pub use diff::ConfigDiff;
 pub use format::{Format, FormatHint};
+pub use id::{ComponentKey, OutputId};
 pub use loading::{
     load, load_builder_from_paths, load_from_paths, load_from_paths_with_provider, load_from_str,
-    merge_path_lists, process_paths, CONFIG_PATHS,
+    load_source_from_paths, merge_path_lists, process_paths, CONFIG_PATHS,
 };
-pub use proxy::ProxyConfig;
-pub use unit_test::build_unit_tests_main as build_unit_tests;
+pub use sink::{SinkConfig, SinkContext, SinkDescription, SinkHealthcheckOptions, SinkOuter};
+pub use source::{SourceConfig, SourceContext, SourceDescription, SourceOuter};
+pub use transform::{TransformDescription, TransformOuter};
+pub use unit_test::{build_unit_tests, build_unit_tests_main, UnitTestResult};
 pub use validation::warnings;
-pub use vector_core::config::{log_schema, LogSchema};
+pub use vector_core::config::{log_schema, proxy::ProxyConfig, LogSchema};
 
 /// Loads Log Schema from configurations and sets global schema.
 /// Once this is done, configurations can be correctly loaded using
@@ -74,99 +82,133 @@ impl<'a> From<&'a ConfigPath> for &'a PathBuf {
     }
 }
 
+impl ConfigPath {
+    pub const fn as_dir(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Dir(path) => Some(path),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Config {
-    pub global: GlobalOptions,
     #[cfg(feature = "api")]
     pub api: api::Options,
+    pub schema: schema::Options,
+    pub version: Option<String>,
+    #[cfg(feature = "enterprise")]
+    pub enterprise: Option<enterprise::Options>,
+    pub global: GlobalOptions,
     pub healthchecks: HealthcheckOptions,
-    pub sources: IndexMap<String, SourceOuter>,
-    pub sinks: IndexMap<String, SinkOuter>,
-    pub transforms: IndexMap<String, TransformOuter>,
+    sources: IndexMap<ComponentKey, SourceOuter>,
+    sinks: IndexMap<ComponentKey, SinkOuter<OutputId>>,
+    transforms: IndexMap<ComponentKey, TransformOuter<OutputId>>,
+    pub enrichment_tables: IndexMap<ComponentKey, EnrichmentTableOuter>,
     tests: Vec<TestDefinition>,
-    expansions: IndexMap<String, Vec<String>>,
+    expansions: IndexMap<ComponentKey, Vec<ComponentKey>>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-#[serde(default)]
-pub struct GlobalOptions {
-    #[serde(default = "default_data_dir")]
-    pub data_dir: Option<PathBuf>,
-    #[serde(skip_serializing_if = "crate::serde::skip_serializing_if_default")]
-    pub log_schema: LogSchema,
-    #[serde(skip_serializing_if = "crate::serde::skip_serializing_if_default")]
-    pub timezone: TimeZone,
-    #[serde(skip_serializing_if = "crate::serde::skip_serializing_if_default")]
-    pub proxy: ProxyConfig,
-}
-
-pub fn default_data_dir() -> Option<PathBuf> {
-    Some(PathBuf::from("/var/lib/vector/"))
-}
-
-#[derive(Debug, Snafu)]
-pub enum DataDirError {
-    #[snafu(display("data_dir option required, but not given here or globally"))]
-    MissingDataDir,
-    #[snafu(display("data_dir {:?} does not exist", data_dir))]
-    DoesNotExist { data_dir: PathBuf },
-    #[snafu(display("data_dir {:?} is not writable", data_dir))]
-    NotWritable { data_dir: PathBuf },
-    #[snafu(display(
-        "Could not create subdirectory {:?} inside of data dir {:?}: {}",
-        subdir,
-        data_dir,
-        source
-    ))]
-    CouldNotCreate {
-        subdir: PathBuf,
-        data_dir: PathBuf,
-        source: std::io::Error,
-    },
-}
-
-impl GlobalOptions {
-    /// Resolve the `data_dir` option in either the global or local
-    /// config, and validate that it exists and is writable.
-    pub fn resolve_and_validate_data_dir(
-        &self,
-        local_data_dir: Option<&PathBuf>,
-    ) -> crate::Result<PathBuf> {
-        let data_dir = local_data_dir
-            .or_else(|| self.data_dir.as_ref())
-            .ok_or(DataDirError::MissingDataDir)
-            .map_err(Box::new)?
-            .to_path_buf();
-        if !data_dir.exists() {
-            return Err(DataDirError::DoesNotExist { data_dir }.into());
-        }
-        let readonly = std::fs::metadata(&data_dir)
-            .map(|meta| meta.permissions().readonly())
-            .unwrap_or(true);
-        if readonly {
-            return Err(DataDirError::NotWritable { data_dir }.into());
-        }
-        Ok(data_dir)
+impl Config {
+    pub fn builder() -> builder::ConfigBuilder {
+        Default::default()
     }
 
-    /// Resolve the `data_dir` option using
-    /// `resolve_and_validate_data_dir` and then ensure a named
-    /// subdirectory exists.
-    pub fn resolve_and_make_data_subdir(
-        &self,
-        local: Option<&PathBuf>,
-        subdir: &str,
-    ) -> crate::Result<PathBuf> {
-        let data_dir = self.resolve_and_validate_data_dir(local)?;
+    pub fn sources(&self) -> impl Iterator<Item = (&ComponentKey, &SourceOuter)> {
+        self.sources.iter()
+    }
 
-        let mut data_subdir = data_dir.clone();
-        data_subdir.push(subdir);
+    pub fn source(&self, id: &ComponentKey) -> Option<&SourceOuter> {
+        self.sources.get(id)
+    }
 
-        DirBuilder::new()
-            .recursive(true)
-            .create(&data_subdir)
-            .with_context(|| CouldNotCreate { subdir, data_dir })?;
-        Ok(data_subdir)
+    pub fn transforms(&self) -> impl Iterator<Item = (&ComponentKey, &TransformOuter<OutputId>)> {
+        self.transforms.iter()
+    }
+
+    pub fn transform(&self, id: &ComponentKey) -> Option<&TransformOuter<OutputId>> {
+        self.transforms.get(id)
+    }
+
+    pub fn sinks(&self) -> impl Iterator<Item = (&ComponentKey, &SinkOuter<OutputId>)> {
+        self.sinks.iter()
+    }
+
+    pub fn sink(&self, id: &ComponentKey) -> Option<&SinkOuter<OutputId>> {
+        self.sinks.get(id)
+    }
+
+    pub fn inputs_for_node(&self, id: &ComponentKey) -> Option<&[OutputId]> {
+        self.transforms
+            .get(id)
+            .map(|t| t.inputs.as_slice())
+            .or_else(|| self.sinks.get(id).map(|s| s.inputs.as_slice()))
+    }
+
+    /// Expand a logical component id (i.e. from the config file) into the ids of the
+    /// components it was expanded to as part of the macro process. Does not check that the
+    /// identifier is otherwise valid.
+    pub fn expand_input(&self, identifier: &ComponentKey) -> Vec<ComponentKey> {
+        self.expansions
+            .get(identifier)
+            .cloned()
+            .unwrap_or_else(|| vec![identifier.clone()])
+    }
+
+    pub fn propagate_acknowledgements(&mut self) -> Result<(), Vec<String>> {
+        if self.global.acknowledgements.enabled() {
+            for (name, sink) in &self.sinks {
+                if sink.inner.acknowledgements().is_none() {
+                    warn!(
+                        message = "Acknowledgements are globally enabled but sink does not support them.",
+                        sink = %name,
+                    );
+                }
+            }
+        }
+
+        let inputs: Vec<_> = self
+            .sinks
+            .iter()
+            .filter(|(_, sink)| {
+                sink.inner
+                    .acknowledgements()
+                    .unwrap_or(&self.global.acknowledgements)
+                    .merge_default(&self.global.acknowledgements)
+                    .enabled()
+            })
+            .flat_map(|(name, sink)| {
+                sink.inputs
+                    .iter()
+                    .map(|input| (name.clone(), input.clone()))
+            })
+            .collect();
+        self.propagate_acks_rec(inputs);
+        Ok(())
+    }
+
+    fn propagate_acks_rec(&mut self, sink_inputs: Vec<(ComponentKey, OutputId)>) {
+        for (sink, input) in sink_inputs {
+            let component = &input.component;
+            if let Some(source) = self.sources.get_mut(component) {
+                if source.inner.can_acknowledge() {
+                    source.sink_acknowledgements = true;
+                } else {
+                    warn!(
+                        message = "Source has acknowledgements enabled by a sink, but acknowledgements are not supported by this source. Silent data loss could occur.",
+                        source = component.id(),
+                        sink = sink.id(),
+                    );
+                }
+            } else if let Some(transform) = self.transforms.get(component) {
+                let inputs = transform
+                    .inputs
+                    .iter()
+                    .map(|input| (sink.clone(), input.clone()))
+                    .collect();
+                self.propagate_acks_rec(inputs);
+            }
+        }
     }
 }
 
@@ -199,13 +241,6 @@ impl Default for HealthcheckOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Copy)]
-pub enum DataType {
-    Any,
-    Log,
-    Metric,
-}
-
 pub trait GenerateConfig {
     fn generate_config() -> toml::Value;
 }
@@ -221,283 +256,30 @@ macro_rules! impl_generate_config_from_default {
     };
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct SourceOuter {
-    #[serde(default = "default_acknowledgements")]
-    pub acknowledgements: bool,
-    #[serde(
-        default,
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
-    )]
-    pub proxy: ProxyConfig,
-    #[serde(flatten)]
-    pub(super) inner: Box<dyn SourceConfig>,
-}
-
-fn default_acknowledgements() -> bool {
-    false
-}
-
-impl SourceOuter {
-    pub(crate) fn new(source: impl SourceConfig + 'static) -> Self {
-        Self {
-            acknowledgements: default_acknowledgements(),
-            inner: Box::new(source),
-            proxy: Default::default(),
-        }
-    }
-}
-
-#[async_trait]
-#[typetag::serde(tag = "type")]
-pub trait SourceConfig: core::fmt::Debug + Send + Sync {
-    async fn build(&self, cx: SourceContext) -> crate::Result<sources::Source>;
-
-    fn output_type(&self) -> DataType;
-
-    fn source_type(&self) -> &'static str;
-
-    /// Resources that the source is using.
-    fn resources(&self) -> Vec<Resource> {
-        Vec::new()
-    }
-}
-
-pub struct SourceContext {
-    pub name: String,
-    pub globals: GlobalOptions,
-    pub shutdown: ShutdownSignal,
-    pub out: Pipeline,
-    pub acknowledgements: bool,
-    pub proxy: ProxyConfig,
-}
-
-impl SourceContext {
-    #[cfg(test)]
-    pub fn new_shutdown(
-        name: &str,
-        out: Pipeline,
-    ) -> (Self, crate::shutdown::SourceShutdownCoordinator) {
-        let mut shutdown = crate::shutdown::SourceShutdownCoordinator::default();
-        let (shutdown_signal, _) = shutdown.register_source(name);
-        (
-            Self {
-                name: name.into(),
-                globals: GlobalOptions::default(),
-                shutdown: shutdown_signal,
-                out,
-                acknowledgements: default_acknowledgements(),
-                proxy: Default::default(),
-            },
-            shutdown,
-        )
-    }
-
-    #[cfg(test)]
-    pub fn new_test(out: Pipeline) -> Self {
-        Self {
-            name: "default".into(),
-            globals: GlobalOptions::default(),
-            shutdown: ShutdownSignal::noop(),
-            out,
-            acknowledgements: default_acknowledgements(),
-            proxy: Default::default(),
-        }
-    }
-}
-
-pub type SourceDescription = ComponentDescription<Box<dyn SourceConfig>>;
-
-inventory::collect!(SourceDescription);
-
 #[derive(Deserialize, Serialize, Debug)]
-pub struct SinkOuter {
-    pub inputs: Vec<String>,
-
-    // We are accepting this option for backward compatibility.
-    healthcheck_uri: Option<UriSerde>,
-
-    // We are accepting bool for backward compatibility.
-    #[serde(deserialize_with = "crate::serde::bool_or_struct")]
-    #[serde(default)]
-    healthcheck: SinkHealthcheckOptions,
-
-    #[serde(default)]
-    pub buffer: crate::buffers::BufferConfig,
-
-    #[serde(
-        default,
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
-    )]
-    proxy: ProxyConfig,
-
+pub struct EnrichmentTableOuter {
     #[serde(flatten)]
-    pub inner: Box<dyn SinkConfig>,
+    pub inner: Box<dyn EnrichmentTableConfig>,
 }
 
-impl SinkOuter {
-    pub fn new(inputs: Vec<String>, inner: Box<dyn SinkConfig>) -> Self {
-        SinkOuter {
-            buffer: Default::default(),
-            healthcheck: SinkHealthcheckOptions::default(),
-            healthcheck_uri: None,
-            inner,
-            inputs,
-            proxy: Default::default(),
-        }
-    }
-
-    pub fn resources(&self, name: &str) -> Vec<Resource> {
-        let mut resources = self.inner.resources();
-        resources.append(&mut self.buffer.resources(name));
-        resources
-    }
-
-    pub fn healthcheck(&self) -> SinkHealthcheckOptions {
-        if self.healthcheck_uri.is_some() && self.healthcheck.uri.is_some() {
-            warn!("Both `healthcheck.uri` and `healthcheck_uri` options are specified. Using value of `healthcheck.uri`.")
-        } else if self.healthcheck_uri.is_some() {
-            warn!("`healthcheck_uri` option has been deprecated, use `healthcheck.uri` instead. ")
-        }
-        SinkHealthcheckOptions {
-            uri: self
-                .healthcheck
-                .uri
-                .clone()
-                .or_else(|| self.healthcheck_uri.clone()),
-            ..self.healthcheck.clone()
-        }
-    }
-
-    pub fn proxy(&self) -> &ProxyConfig {
-        &self.proxy
-    }
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
-#[serde(default)]
-pub struct SinkHealthcheckOptions {
-    pub enabled: bool,
-    pub uri: Option<UriSerde>,
-}
-
-impl Default for SinkHealthcheckOptions {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            uri: None,
-        }
-    }
-}
-
-impl From<bool> for SinkHealthcheckOptions {
-    fn from(enabled: bool) -> Self {
-        Self { enabled, uri: None }
-    }
-}
-
-impl From<UriSerde> for SinkHealthcheckOptions {
-    fn from(uri: UriSerde) -> Self {
-        Self {
-            enabled: true,
-            uri: Some(uri),
-        }
+impl EnrichmentTableOuter {
+    pub fn new(inner: Box<dyn EnrichmentTableConfig>) -> Self {
+        EnrichmentTableOuter { inner }
     }
 }
 
 #[async_trait]
 #[typetag::serde(tag = "type")]
-pub trait SinkConfig: core::fmt::Debug + Send + Sync {
+pub trait EnrichmentTableConfig: core::fmt::Debug + Send + Sync + dyn_clone::DynClone {
     async fn build(
         &self,
-        cx: SinkContext,
-    ) -> crate::Result<(sinks::VectorSink, sinks::Healthcheck)>;
-
-    fn input_type(&self) -> DataType;
-
-    fn sink_type(&self) -> &'static str;
-
-    /// Resources that the sink is using.
-    fn resources(&self) -> Vec<Resource> {
-        Vec::new()
-    }
+        globals: &GlobalOptions,
+    ) -> crate::Result<Box<dyn enrichment::Table + Send + Sync>>;
 }
 
-#[derive(Debug, Clone)]
-pub struct SinkContext {
-    pub(super) acker: Acker,
-    pub(super) healthcheck: SinkHealthcheckOptions,
-    pub(super) globals: GlobalOptions,
-    pub(super) proxy: ProxyConfig,
-}
+pub type EnrichmentTableDescription = ComponentDescription<Box<dyn EnrichmentTableConfig>>;
 
-impl SinkContext {
-    #[cfg(test)]
-    pub fn new_test() -> Self {
-        Self {
-            acker: Acker::Null,
-            healthcheck: SinkHealthcheckOptions::default(),
-            globals: GlobalOptions::default(),
-            proxy: ProxyConfig::default(),
-        }
-    }
-
-    pub fn acker(&self) -> Acker {
-        self.acker.clone()
-    }
-
-    pub fn globals(&self) -> &GlobalOptions {
-        &self.globals
-    }
-
-    pub fn proxy(&self) -> &ProxyConfig {
-        &self.proxy
-    }
-}
-
-pub type SinkDescription = ComponentDescription<Box<dyn SinkConfig>>;
-
-inventory::collect!(SinkDescription);
-
-#[derive(Deserialize, Serialize, Debug)]
-pub struct TransformOuter {
-    pub inputs: Vec<String>,
-    #[serde(flatten)]
-    pub inner: Box<dyn TransformConfig>,
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-pub enum ExpandType {
-    Parallel,
-    Serial,
-}
-
-#[async_trait]
-#[typetag::serde(tag = "type")]
-pub trait TransformConfig: core::fmt::Debug + Send + Sync + dyn_clone::DynClone {
-    async fn build(&self, globals: &GlobalOptions) -> crate::Result<transforms::Transform>;
-
-    fn input_type(&self) -> DataType;
-
-    fn output_type(&self) -> DataType;
-
-    fn transform_type(&self) -> &'static str;
-
-    /// Allows a transform configuration to expand itself into multiple "child"
-    /// transformations to replace it. This allows a transform to act as a macro
-    /// for various patterns.
-    fn expand(
-        &mut self,
-    ) -> crate::Result<Option<(IndexMap<String, Box<dyn TransformConfig>>, ExpandType)>> {
-        Ok(None)
-    }
-}
-
-dyn_clone::clone_trait_object!(TransformConfig);
-
-pub type TransformDescription = ComponentDescription<Box<dyn TransformConfig>>;
-
-inventory::collect!(TransformDescription);
+inventory::collect!(EnrichmentTableDescription);
 
 /// Unique thing, like port, of which only one owner can be.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -515,11 +297,11 @@ pub enum Protocol {
 }
 
 impl Resource {
-    pub fn tcp(addr: SocketAddr) -> Self {
+    pub const fn tcp(addr: SocketAddr) -> Self {
         Self::Port(addr, Protocol::Tcp)
     }
 
-    pub fn udp(addr: SocketAddr) -> Self {
+    pub const fn udp(addr: SocketAddr) -> Self {
         Self::Port(addr, Protocol::Udp)
     }
 
@@ -587,15 +369,143 @@ impl Display for Resource {
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(deny_unknown_fields)]
-pub struct TestDefinition {
+pub struct TestDefinition<T = OutputId> {
     pub name: String,
     pub input: Option<TestInput>,
     #[serde(default)]
     pub inputs: Vec<TestInput>,
     #[serde(default)]
-    pub outputs: Vec<TestOutput>,
+    pub outputs: Vec<TestOutput<T>>,
     #[serde(default)]
-    pub no_outputs_from: Vec<String>,
+    pub no_outputs_from: Vec<T>,
+}
+
+impl TestDefinition<String> {
+    fn resolve_outputs(
+        self,
+        graph: &graph::Graph,
+        expansions: &IndexMap<String, Vec<String>>,
+    ) -> Result<TestDefinition<OutputId>, Vec<String>> {
+        let TestDefinition {
+            name,
+            input,
+            inputs,
+            outputs,
+            no_outputs_from,
+        } = self;
+        let mut errors = Vec::new();
+
+        let output_map = graph.input_map().expect("ambiguous outputs");
+
+        let outputs = outputs
+            .into_iter()
+            .map(|old| {
+                let TestOutput {
+                    extract_from,
+                    conditions,
+                } = old;
+
+                let extract_from = extract_from
+                    .into_vec()
+                    .into_iter()
+                    .flat_map(|from| {
+                        if let Some(expanded) = expansions.get(&from) {
+                            expanded.to_vec()
+                        } else {
+                            vec![from]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                (extract_from, conditions)
+            })
+            .filter_map(|(extract_from, conditions)| {
+                let mut outputs = Vec::new();
+                for from in extract_from {
+                    if let Some(output_id) = output_map.get(&from) {
+                        outputs.push(output_id.clone());
+                    } else {
+                        errors.push(format!(
+                            r#"Invalid extract_from target in test '{}': '{}' does not exist"#,
+                            name, from
+                        ));
+                    }
+                }
+                if outputs.is_empty() {
+                    None
+                } else {
+                    Some(TestOutput {
+                        extract_from: outputs.into(),
+                        conditions,
+                    })
+                }
+            })
+            .collect();
+
+        let no_outputs_from = no_outputs_from
+            .into_iter()
+            .filter_map(|o| {
+                if let Some(output_id) = output_map.get(&o) {
+                    Some(output_id.clone())
+                } else {
+                    errors.push(format!(
+                        r#"Invalid no_outputs_from target in test '{}': '{}' does not exist"#,
+                        name, o
+                    ));
+                    None
+                }
+            })
+            .collect();
+
+        if errors.is_empty() {
+            Ok(TestDefinition {
+                name,
+                input,
+                inputs,
+                outputs,
+                no_outputs_from,
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+impl TestDefinition<OutputId> {
+    fn stringify(self) -> TestDefinition<String> {
+        let TestDefinition {
+            name,
+            input,
+            inputs,
+            outputs,
+            no_outputs_from,
+        } = self;
+
+        let outputs = outputs
+            .into_iter()
+            .map(|old| TestOutput {
+                extract_from: match old.extract_from {
+                    OneOrMany::One(value) => value.to_string().into(),
+                    OneOrMany::Many(values) => values
+                        .iter()
+                        .map(|item| item.to_string())
+                        .collect::<Vec<_>>()
+                        .into(),
+                },
+                conditions: old.conditions,
+            })
+            .collect();
+
+        let no_outputs_from = no_outputs_from.iter().map(ToString::to_string).collect();
+
+        TestDefinition {
+            name,
+            input,
+            inputs,
+            outputs,
+            no_outputs_from,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -610,7 +520,7 @@ pub enum TestInputValue {
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct TestInput {
-    pub insert_at: String,
+    pub insert_at: ComponentKey,
     #[serde(default = "default_test_input_type", rename = "type")]
     pub type_str: String,
     pub value: Option<String>,
@@ -624,25 +534,9 @@ fn default_test_input_type() -> String {
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(deny_unknown_fields)]
-pub struct TestOutput {
-    pub extract_from: String,
+pub struct TestOutput<T = OutputId> {
+    pub extract_from: OneOrMany<T>,
     pub conditions: Option<Vec<conditions::AnyCondition>>,
-}
-
-impl Config {
-    pub fn builder() -> builder::ConfigBuilder {
-        Default::default()
-    }
-
-    /// Expand a logical component name (i.e. from the config file) into the names of the
-    /// components it was expanded to as part of the macro process. Does not check that the
-    /// identifier is otherwise valid.
-    pub fn get_inputs(&self, identifier: &str) -> Vec<String> {
-        self.expansions
-            .get(identifier)
-            .cloned()
-            .unwrap_or_else(|| vec![String::from(identifier)])
-    }
 }
 
 #[cfg(all(
@@ -651,10 +545,12 @@ impl Config {
     feature = "sinks-console",
     feature = "transforms-json_parser"
 ))]
-mod test {
-    use super::{builder::ConfigBuilder, format, load_from_str, Format};
-    use indoc::indoc;
+mod tests {
     use std::path::PathBuf;
+
+    use indoc::indoc;
+
+    use super::{builder::ConfigBuilder, format, load_from_str, ComponentKey, Format};
 
     #[test]
     fn default_data_dir() {
@@ -669,7 +565,7 @@ mod test {
                   inputs = ["in"]
                   encoding = "json"
             "#},
-            Some(Format::Toml),
+            Format::Toml,
         )
         .unwrap();
 
@@ -692,7 +588,7 @@ mod test {
                   inputs = ["in"]
                   encoding = "json"
             "#},
-            Some(Format::Toml),
+            Format::Toml,
         )
         .unwrap();
 
@@ -725,7 +621,7 @@ mod test {
                   inputs = ["in"]
                   encoding = "json"
             "#},
-            Some(Format::Toml),
+            Format::Toml,
         )
         .unwrap();
 
@@ -747,7 +643,7 @@ mod test {
                   inputs = ["in"]
                   encoding = "json"
             "#},
-            Some(Format::Toml),
+            Format::Toml,
         )
         .unwrap();
 
@@ -756,6 +652,9 @@ mod test {
                 format::deserialize(
                     indoc! {r#"
                         data_dir = "/foobar"
+
+                        [proxy]
+                          http = "http://proxy.inc:3128"
 
                         [transforms.foo]
                           type = "json_parser"
@@ -773,17 +672,19 @@ mod test {
                               type = "check_fields"
                               "message.equals" = "Sorry, I'm busy this week Cecil"
                     "#},
-                    Some(Format::Toml),
+                    Format::Toml,
                 )
                 .unwrap()
             ),
             Ok(())
         );
 
+        assert!(config.global.proxy.http.is_some());
+        assert!(config.global.proxy.https.is_none());
         assert_eq!(Some(PathBuf::from("/foobar")), config.global.data_dir);
-        assert!(config.sources.contains_key("in"));
-        assert!(config.sinks.contains_key("out"));
-        assert!(config.transforms.contains_key("foo"));
+        assert!(config.sources.contains_key(&ComponentKey::from("in")));
+        assert!(config.sinks.contains_key(&ComponentKey::from("out")));
+        assert!(config.transforms.contains_key(&ComponentKey::from("foo")));
         assert_eq!(config.tests.len(), 1);
     }
 
@@ -800,7 +701,7 @@ mod test {
                   inputs = ["in"]
                   encoding = "json"
             "#},
-            Some(Format::Toml),
+            Format::Toml,
         )
         .unwrap();
 
@@ -821,13 +722,13 @@ mod test {
                           inputs = ["in"]
                           encoding = "json"
                     "#},
-                    Some(Format::Toml),
+                    Format::Toml,
                 )
                 .unwrap()
             ),
             Err(vec![
-                "duplicate source name found: in".into(),
-                "duplicate sink name found: out".into(),
+                "duplicate source id found: in".into(),
+                "duplicate sink id found: out".into(),
             ])
         );
     }
@@ -853,25 +754,202 @@ mod test {
                   inputs = ["in"]
                   encoding = "json"
             "#},
-            Some(Format::Toml),
+            Format::Toml,
         )
         .unwrap();
         assert_eq!(config.global.proxy.http, Some("http://server:3128".into()));
         assert_eq!(config.global.proxy.https, Some("http://other:3128".into()));
         assert!(config.global.proxy.no_proxy.matches("localhost"));
-        let source = config.sources.get("in").unwrap();
+        let source = config.sources.get(&ComponentKey::from("in")).unwrap();
         assert_eq!(source.proxy.http, Some("http://server:3128".into()));
         assert_eq!(source.proxy.https, Some("http://other:3128".into()));
         assert!(source.proxy.no_proxy.matches("localhost"));
+    }
+
+    #[test]
+    fn with_partial_proxy() {
+        let config: ConfigBuilder = format::deserialize(
+            indoc! {r#"
+                [proxy]
+                  http = "http://server:3128"
+
+                [sources.in]
+                  type = "nginx_metrics"
+                  endpoints = ["http://localhost:8000/basic_status"]
+
+                [sources.in.proxy]
+                  http = "http://server:3128"
+                  https = "http://other:3128"
+                  no_proxy = ["localhost", "127.0.0.1"]
+
+                [sinks.out]
+                  type = "console"
+                  inputs = ["in"]
+                  encoding = "json"
+            "#},
+            Format::Toml,
+        )
+        .unwrap();
+        assert_eq!(config.global.proxy.http, Some("http://server:3128".into()));
+        assert_eq!(config.global.proxy.https, None);
+        let source = config.sources.get(&ComponentKey::from("in")).unwrap();
+        assert_eq!(source.proxy.http, Some("http://server:3128".into()));
+        assert_eq!(source.proxy.https, Some("http://other:3128".into()));
+        assert!(source.proxy.no_proxy.matches("localhost"));
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn order_independent_sha256_hashes() {
+        let config1: ConfigBuilder = format::deserialize(
+            indoc! {r#"
+                data_dir = "/tmp"
+
+                [api]
+                    enabled = true
+
+                [sources.file]
+                    type = "file"
+                    ignore_older_secs = 600
+                    include = ["/var/log/**/*.log"]
+                    read_from = "beginning"
+
+                [sources.internal_metrics]
+                    type = "internal_metrics"
+                    namespace = "pipelines"
+
+                [transforms.filter]
+                    type = "filter"
+                    inputs = ["internal_metrics"]
+                    condition = """
+                        .name == "processed_bytes_total"
+                    """
+
+                [sinks.out]
+                    type = "console"
+                    inputs = ["filter"]
+                    target = "stdout"
+                    encoding.codec = "json"
+            "#},
+            Format::Toml,
+        )
+        .unwrap();
+
+        let config2: ConfigBuilder = format::deserialize(
+            indoc! {r#"
+                data_dir = "/tmp"
+
+                [sources.internal_metrics]
+                    type = "internal_metrics"
+                    namespace = "pipelines"
+
+                [sources.file]
+                    type = "file"
+                    ignore_older_secs = 600
+                    include = ["/var/log/**/*.log"]
+                    read_from = "beginning"
+
+                [transforms.filter]
+                    type = "filter"
+                    inputs = ["internal_metrics"]
+                    condition = """
+                        .name == "processed_bytes_total"
+                    """
+
+                [sinks.out]
+                    type = "console"
+                    inputs = ["filter"]
+                    target = "stdout"
+                    encoding.codec = "json"
+
+                [api]
+                    enabled = true
+            "#},
+            Format::Toml,
+        )
+        .unwrap();
+
+        assert_eq!(config1.sha256_hash(), config2.sha256_hash())
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "sources-file",
+    feature = "sinks-file",
+    feature = "transforms-json_parser"
+))]
+mod acknowledgements_tests {
+    use indoc::indoc;
+
+    use super::*;
+
+    #[test]
+    fn propagates_settings() {
+        // The topology:
+        // in1 => out1
+        // in2 => out2 (acks enabled)
+        // in3 => parse3 => out3 (acks enabled)
+        let config: ConfigBuilder = format::deserialize(
+            indoc! {r#"
+                data_dir = "/tmp"
+                [sources.in1]
+                    type = "file"
+                [sources.in2]
+                    type = "file"
+                [sources.in3]
+                    type = "file"
+                [transforms.parse3]
+                    type = "json_parser"
+                    inputs = ["in3"]
+                [sinks.out1]
+                    type = "file"
+                    inputs = ["in1"]
+                    encoding = "text"
+                    path = "/path/to/out1"
+                [sinks.out2]
+                    type = "file"
+                    inputs = ["in2"]
+                    encoding = "text"
+                    path = "/path/to/out2"
+                    acknowledgements = true
+                [sinks.out3]
+                    type = "file"
+                    inputs = ["parse3"]
+                    encoding = "text"
+                    path = "/path/to/out3"
+                    acknowledgements.enabled = true
+            "#},
+            Format::Toml,
+        )
+        .unwrap();
+
+        for source in config.sources.values() {
+            assert!(
+                !source.sink_acknowledgements,
+                "Source `sink_acknowledgements` should be `false` before propagation"
+            );
+        }
+
+        let config = config.build().unwrap();
+
+        let get = |key: &str| config.sources.get(&ComponentKey::from(key)).unwrap();
+        assert!(!get("in1").sink_acknowledgements);
+        assert!(get("in2").sink_acknowledgements);
+        assert!(get("in3").sink_acknowledgements);
     }
 }
 
 #[cfg(all(test, feature = "sources-stdin", feature = "sinks-console"))]
 mod resource_tests {
-    use super::{load_from_str, Format, Resource};
+    use std::{
+        collections::{HashMap, HashSet},
+        net::{Ipv4Addr, SocketAddr},
+    };
+
     use indoc::indoc;
-    use std::collections::{HashMap, HashSet};
-    use std::net::{Ipv4Addr, SocketAddr};
+
+    use super::{load_from_str, Format, Resource};
 
     fn localhost(port: u16) -> Resource {
         Resource::tcp(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port))
@@ -998,8 +1076,55 @@ mod resource_tests {
                   inputs = ["in0","in1"]
                   encoding = "json"
             "#},
-            Some(Format::Toml),
+            Format::Toml,
         )
         .is_err());
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "sources-stdin",
+    feature = "sinks-console",
+    feature = "transforms-pipelines",
+    feature = "transforms-filter"
+))]
+mod pipelines_tests {
+    use indoc::indoc;
+
+    use super::{load_from_str, Format};
+
+    #[test]
+    fn forbid_pipeline_nesting() {
+        let res = load_from_str(
+            indoc! {r#"
+                [sources.in]
+                  type = "stdin"
+
+                [transforms.processing]
+                  inputs = ["in"]
+                  type = "pipelines"
+
+                  [[transforms.processing.logs]]
+                    name = "foo"
+
+                    [[transforms.processing.logs.transforms]]
+                      type = "pipelines"
+
+                      [[transforms.processing.logs.transforms.logs]]
+                        name = "bar"
+
+                          [[transforms.processing.logs.transforms.logs.transforms]]
+                            type = "filter"
+                            condition = ""
+
+                [sinks.out]
+                  type = "console"
+                  inputs = ["processing"]
+                  encoding = "json"
+            "#},
+            Format::Toml,
+        );
+        assert!(res.is_err(), "should error");
     }
 }

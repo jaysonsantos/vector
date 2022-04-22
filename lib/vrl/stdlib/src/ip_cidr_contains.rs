@@ -1,6 +1,19 @@
 use cidr_utils::cidr::IpCidr;
 use vrl::prelude::*;
 
+fn ip_cidr_contains(value: Value, cidr: Value) -> Resolved {
+    let value = value
+        .try_bytes_utf8_lossy()?
+        .parse()
+        .map_err(|err| format!("unable to parse IP address: {}", err))?;
+    let cidr = {
+        let cidr = cidr.try_bytes_utf8_lossy()?;
+
+        IpCidr::from_str(cidr).map_err(|err| format!("unable to parse CIDR: {}", err))?
+    };
+    Ok(cidr.contains(value).into())
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct IpCidrContains;
 
@@ -53,11 +66,23 @@ impl Function for IpCidrContains {
         ]
     }
 
-    fn compile(&self, mut arguments: ArgumentList) -> Compiled {
+    fn compile(
+        &self,
+        _state: (&mut state::LocalEnv, &mut state::ExternalEnv),
+        _ctx: &mut FunctionCompileContext,
+        mut arguments: ArgumentList,
+    ) -> Compiled {
         let cidr = arguments.required("cidr");
         let value = arguments.required("value");
 
         Ok(Box::new(IpCidrContainsFn { cidr, value }))
+    }
+
+    fn call_by_vm(&self, _ctx: &mut Context, args: &mut VmArgumentList) -> Resolved {
+        let cidr = args.required("cidr");
+        let value = args.required("value");
+
+        ip_cidr_contains(value, cidr)
     }
 }
 
@@ -69,27 +94,14 @@ struct IpCidrContainsFn {
 
 impl Expression for IpCidrContainsFn {
     fn resolve(&self, ctx: &mut Context) -> Resolved {
-        let value = {
-            let value = self.value.resolve(ctx)?;
+        let value = self.value.resolve(ctx)?;
+        let cidr = self.cidr.resolve(ctx)?;
 
-            value
-                .try_bytes_utf8_lossy()?
-                .parse()
-                .map_err(|err| format!("unable to parse IP address: {}", err))?
-        };
-
-        let cidr = {
-            let value = self.cidr.resolve(ctx)?;
-            let cidr = value.try_bytes_utf8_lossy()?;
-
-            IpCidr::from_str(cidr).map_err(|err| format!("unable to parse CIDR: {}", err))?
-        };
-
-        Ok(cidr.contains(value).into())
+        ip_cidr_contains(value, cidr)
     }
 
-    fn type_def(&self, _: &state::Compiler) -> TypeDef {
-        TypeDef::new().fallible().boolean()
+    fn type_def(&self, _: (&state::LocalEnv, &state::ExternalEnv)) -> TypeDef {
+        TypeDef::boolean().fallible()
     }
 }
 
@@ -105,7 +117,7 @@ mod tests {
                              cidr: "192.168.0.0/16",
             ],
             want: Ok(value!(true)),
-            tdef: TypeDef::new().fallible().boolean(),
+            tdef: TypeDef::boolean().fallible(),
         }
 
         ipv4_no {
@@ -113,7 +125,7 @@ mod tests {
                              cidr: "192.168.0.0/24",
             ],
             want: Ok(value!(false)),
-            tdef: TypeDef::new().fallible().boolean(),
+            tdef: TypeDef::boolean().fallible(),
         }
 
         ipv6_yes {
@@ -121,7 +133,7 @@ mod tests {
                              cidr: "2001:4f8:3:ba::/64",
             ],
             want: Ok(value!(true)),
-            tdef: TypeDef::new().fallible().boolean(),
+            tdef: TypeDef::boolean().fallible(),
         }
 
         ipv6_no {
@@ -129,7 +141,7 @@ mod tests {
                              cidr: "2001:4f8:4:ba::/64",
             ],
             want: Ok(value!(false)),
-            tdef: TypeDef::new().fallible().boolean(),
+            tdef: TypeDef::boolean().fallible(),
         }
     ];
 }

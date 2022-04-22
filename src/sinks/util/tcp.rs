@@ -1,15 +1,36 @@
+use std::{
+    io::ErrorKind,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
+use futures::{stream::BoxStream, task::noop_waker_ref, SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use snafu::{ResultExt, Snafu};
+use tokio::{
+    io::{AsyncRead, ReadBuf},
+    net::TcpStream,
+    time::sleep,
+};
+use tokio_util::codec::Encoder;
+use vector_core::{buffers::Acker, ByteSizeOf};
+
 use crate::{
-    buffers::Acker,
     config::SinkContext,
     dns,
     event::Event,
     internal_events::{
-        ConnectionOpen, OpenGauge, SocketMode, TcpSocketConnectionEstablished,
-        TcpSocketConnectionFailed, TcpSocketConnectionShutdown, TcpSocketError,
+        ConnectionOpen, OpenGauge, SocketMode, TcpSocketConnectionError,
+        TcpSocketConnectionEstablished, TcpSocketConnectionShutdown, TcpSocketError,
     },
     sink::VecSinkExt,
     sinks::{
         util::{
+            encoding::Transformer,
             retries::ExponentialBackoff,
             socket_bytes_sink::{BytesSink, ShutdownCheck},
             EncodedEvent, SinkBuildError, StreamSink,
@@ -18,24 +39,6 @@ use crate::{
     },
     tcp::TcpKeepaliveConfig,
     tls::{MaybeTlsSettings, MaybeTlsStream, TlsConfig, TlsError},
-};
-use async_trait::async_trait;
-use bytes::Bytes;
-use futures::{stream::BoxStream, task::noop_waker_ref, SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
-use snafu::{ResultExt, Snafu};
-use std::{
-    io::ErrorKind,
-    net::SocketAddr,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Duration,
-};
-use tokio::{
-    io::{AsyncRead, ReadBuf},
-    net::TcpStream,
-    time::sleep,
 };
 
 #[derive(Debug, Snafu)]
@@ -51,7 +54,6 @@ enum TcpError {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-#[serde(deny_unknown_fields)]
 pub struct TcpSinkConfig {
     address: String,
     keepalive: Option<TcpKeepaliveConfig>,
@@ -60,7 +62,7 @@ pub struct TcpSinkConfig {
 }
 
 impl TcpSinkConfig {
-    pub fn new(
+    pub const fn new(
         address: String,
         keepalive: Option<TcpKeepaliveConfig>,
         tls: Option<TlsConfig>,
@@ -74,7 +76,7 @@ impl TcpSinkConfig {
         }
     }
 
-    pub fn from_address(address: String) -> Self {
+    pub const fn from_address(address: String) -> Self {
         Self {
             address,
             keepalive: None,
@@ -86,17 +88,18 @@ impl TcpSinkConfig {
     pub fn build(
         &self,
         cx: SinkContext,
-        encode_event: impl Fn(Event) -> Option<EncodedEvent<Bytes>> + Send + Sync + 'static,
+        transformer: Transformer,
+        encoder: impl Encoder<Event, Error = codecs::encoding::Error> + Clone + Send + Sync + 'static,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
         let uri = self.address.parse::<http::Uri>()?;
         let host = uri.host().ok_or(SinkBuildError::MissingHost)?.to_string();
         let port = uri.port_u16().ok_or(SinkBuildError::MissingPort)?;
         let tls = MaybeTlsSettings::from_config(&self.tls, false)?;
         let connector = TcpConnector::new(host, port, self.keepalive, tls, self.send_buffer_bytes);
-        let sink = TcpSink::new(connector.clone(), cx.acker(), encode_event);
+        let sink = TcpSink::new(connector.clone(), cx.acker(), transformer, encoder);
 
         Ok((
-            VectorSink::Stream(Box::new(sink)),
+            VectorSink::from_event_streamsink(sink),
             Box::pin(async move { connector.healthcheck().await }),
         ))
     }
@@ -112,7 +115,7 @@ struct TcpConnector {
 }
 
 impl TcpConnector {
-    fn new(
+    const fn new(
         host: String,
         port: u16,
         keepalive: Option<TcpKeepaliveConfig>,
@@ -133,7 +136,7 @@ impl TcpConnector {
         Self::new(host, port, None, None.into(), None)
     }
 
-    fn fresh_backoff() -> ExponentialBackoff {
+    const fn fresh_backoff() -> ExponentialBackoff {
         // TODO: make configurable
         ExponentialBackoff::from_millis(2)
             .factor(250)
@@ -144,7 +147,7 @@ impl TcpConnector {
         let ip = dns::Resolver
             .lookup_ip(self.host.clone())
             .await
-            .context(DnsError)?
+            .context(DnsSnafu)?
             .next()
             .ok_or(TcpError::NoAddresses)?;
 
@@ -152,7 +155,7 @@ impl TcpConnector {
         self.tls
             .connect(&self.host, &addr)
             .await
-            .context(ConnectError)
+            .context(ConnectSnafu)
             .map(|mut maybe_tls| {
                 if let Some(keepalive) = self.keepalive {
                     if let Err(error) = maybe_tls.set_keepalive(keepalive) {
@@ -181,7 +184,7 @@ impl TcpConnector {
                     return socket;
                 }
                 Err(error) => {
-                    emit!(TcpSocketConnectionFailed { error });
+                    emit!(TcpSocketConnectionError { error });
                     sleep(backoff.next().unwrap()).await;
                 }
             }
@@ -193,22 +196,26 @@ impl TcpConnector {
     }
 }
 
-struct TcpSink {
+struct TcpSink<E>
+where
+    E: Encoder<Event, Error = codecs::encoding::Error> + Clone + Send + Sync,
+{
     connector: TcpConnector,
     acker: Acker,
-    encode_event: Arc<dyn Fn(Event) -> Option<EncodedEvent<Bytes>> + Send + Sync>,
+    transformer: Transformer,
+    encoder: E,
 }
 
-impl TcpSink {
-    fn new(
-        connector: TcpConnector,
-        acker: Acker,
-        encode_event: impl Fn(Event) -> Option<EncodedEvent<Bytes>> + Send + Sync + 'static,
-    ) -> Self {
+impl<E> TcpSink<E>
+where
+    E: Encoder<Event, Error = codecs::encoding::Error> + Clone + Send + Sync + 'static,
+{
+    fn new(connector: TcpConnector, acker: Acker, transformer: Transformer, encoder: E) -> Self {
         Self {
             connector,
             acker,
-            encode_event: Arc::new(encode_event),
+            transformer,
+            encoder,
         }
     }
 
@@ -248,13 +255,31 @@ impl TcpSink {
 }
 
 #[async_trait]
-impl StreamSink for TcpSink {
-    async fn run(&mut self, input: BoxStream<'_, Event>) -> Result<(), ()> {
+impl<E> StreamSink<Event> for TcpSink<E>
+where
+    E: Encoder<Event, Error = codecs::encoding::Error> + Clone + Send + Sync + Sync + 'static,
+{
+    async fn run(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         // We need [Peekable](https://docs.rs/futures/0.3.6/futures/stream/struct.Peekable.html) for initiating
         // connection only when we have something to send.
-        let encode_event = Arc::clone(&self.encode_event);
+        let mut encoder = self.encoder.clone();
         let mut input = input
-            .map(|event| encode_event(event).unwrap_or_else(|| EncodedEvent::new(Bytes::new())))
+            .map(|mut event| {
+                let byte_size = event.size_of();
+                let finalizers = event.metadata_mut().take_finalizers();
+                self.transformer.transform(&mut event);
+                let mut bytes = BytesMut::new();
+                if encoder.encode(event, &mut bytes).is_ok() {
+                    let item = bytes.freeze();
+                    EncodedEvent {
+                        item,
+                        finalizers,
+                        byte_size,
+                    }
+                } else {
+                    EncodedEvent::new(Bytes::new(), 0)
+                }
+            })
             .peekable();
 
         while Pin::new(&mut input).peek().await.is_some() {
@@ -284,9 +309,10 @@ impl StreamSink for TcpSink {
 
 #[cfg(test)]
 mod test {
+    use tokio::net::TcpListener;
+
     use super::*;
     use crate::test_util::{next_addr, trace_init};
-    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn healthcheck() {

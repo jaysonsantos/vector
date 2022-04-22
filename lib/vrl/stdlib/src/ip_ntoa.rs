@@ -2,6 +2,15 @@ use std::{convert::TryInto, net::Ipv4Addr};
 
 use vrl::prelude::*;
 
+fn ip_ntoa(value: Value) -> Resolved {
+    let i: u32 = value
+        .try_integer()?
+        .try_into()
+        .map_err(|_| String::from("cannot convert to bytes: integer does not fit in u32"))?;
+
+    Ok(Ipv4Addr::from(i).to_string().into())
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct IpNtoa;
 
@@ -21,15 +30,25 @@ impl Function for IpNtoa {
     fn examples(&self) -> &'static [Example] {
         &[Example {
             title: "Example",
-            source: r#"ip_ntoa!(67305985)"#,
+            source: r#"ip_ntoa!(16909060)"#,
             result: Ok("1.2.3.4"),
         }]
     }
 
-    fn compile(&self, mut arguments: ArgumentList) -> Compiled {
+    fn compile(
+        &self,
+        _state: (&mut state::LocalEnv, &mut state::ExternalEnv),
+        _ctx: &mut FunctionCompileContext,
+        mut arguments: ArgumentList,
+    ) -> Compiled {
         let value = arguments.required("value");
 
         Ok(Box::new(IpNtoaFn { value }))
+    }
+
+    fn call_by_vm(&self, _ctx: &mut Context, args: &mut VmArgumentList) -> Resolved {
+        let value = args.required("value");
+        ip_ntoa(value)
     }
 }
 
@@ -40,20 +59,12 @@ struct IpNtoaFn {
 
 impl Expression for IpNtoaFn {
     fn resolve(&self, ctx: &mut Context) -> Resolved {
-        let i: u32 = self
-            .value
-            .resolve(ctx)?
-            .try_integer()?
-            .try_into()
-            .map_err(|_| String::from("cannot convert to bytes: integer does not fit in u32"))?;
-
-        let ip = Ipv4Addr::from(u32::from_be(i));
-
-        Ok(ip.to_string().into())
+        let value = self.value.resolve(ctx)?;
+        ip_ntoa(value)
     }
 
-    fn type_def(&self, _: &state::Compiler) -> TypeDef {
-        TypeDef::new().fallible().bytes()
+    fn type_def(&self, _: (&state::LocalEnv, &state::ExternalEnv)) -> TypeDef {
+        TypeDef::bytes().fallible()
     }
 }
 
@@ -67,13 +78,13 @@ mod tests {
         invalid {
             args: func_args![value: u32::MAX as i64 + 1],
             want: Err("cannot convert to bytes: integer does not fit in u32"),
-            tdef: TypeDef::new().fallible().bytes(),
+            tdef: TypeDef::bytes().fallible(),
         }
 
         valid {
-            args: func_args![value: 67305985],
+            args: func_args![value: 16909060],
             want: Ok(value!("1.2.3.4")),
-            tdef: TypeDef::new().fallible().bytes(),
+            tdef: TypeDef::bytes().fallible(),
         }
     ];
 }
